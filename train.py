@@ -25,16 +25,19 @@ from sklearn.metrics import accuracy_score, f1_score
 
 def calc_loss(args, logits, labels, weights=None):
     # label에 따른 차이가 필요함.
+    if weights is not None:
+        weights = weights.to(labels)
     if args.n_labels != 1:
-        if args.weighted_cross_entropy:
-            loss_fn = nn.CrossEntropyLoss(weight=weights.to(labels))
             # just for binary classification
-        elif args.focal_loss:
-            loss_fn = FocalLoss(args.gamma)
+        if args.focal_loss:
+            loss_fn = FocalLoss(args.gamma, weights)
         else:
-            loss_fn = nn.CrossEntropyLoss()
+            loss_fn = nn.CrossEntropyLoss(weight=weights)
     else:
-        loss_fn = torch.nn.BCEWithLogitsLoss()
+        if args.focal_loss:
+            loss_fn = BinaryFocalLoss(weights, args.gamma)
+        else:
+            loss_fn = torch.nn.BCEWithLogitsLoss()
         logits = logits.squeeze(1)
         labels = labels.float()
     loss = loss_fn(logits, labels)
@@ -50,9 +53,8 @@ def evaluation(args, model, tokenizer, eval_dataloader):
         for data in tqdm(eval_dataloader, desc = 'evaluate', disable =  args.local_rank not in [-1,0]):
             data = {i:j.cuda() for i,j in data.items()}
             output = model.forward(**data)
-            if output.get('loss') is not None:
-                loss = calc_loss(args, output['score'], data['labels'], weights=weights)
-                total_loss+=loss
+            loss = calc_loss(args, output['score'], data['labels'], weights=weights)
+            total_loss+=loss
             if args.n_labels == 1:
                 predict = (torch.sigmoid(output['score'])>=0.5).squeeze(1).long().cpu().tolist()
             else:
@@ -62,14 +64,14 @@ def evaluation(args, model, tokenizer, eval_dataloader):
             actuals.extend(actual)
     acc = accuracy_score(actuals, predicts)
     f1 = f1_score(actuals, predicts, average='weighted')
-    cnt = len(predicts)
-    return dict(loss=total_loss/len(eval_dataloader), acc=acc, f1=f1, cnt=cnt)
+    return dict(loss=total_loss/len(eval_dataloader), acc=acc, f1=f1)
 
 def get_scores(local_rank, scores, distributed:bool):
     if distributed:
-        cnt = sum([j.item() for j in get_global(local_rank, torch.tensor([scores['cnt']]).cuda())])
-        acc = sum([j.item() for j in get_global(local_rank, torch.tensor([scores['acc']]).cuda())])
-        f1 = sum([j.item() for j in get_global(local_rank, torch.tensor([scores['f1']]).cuda())])
+        acc = [j.item() for j in get_global(local_rank, torch.tensor([scores['acc']]).cuda())]
+        acc = sum(acc)/len(acc)
+        f1 = [j.item() for j in get_global(local_rank, torch.tensor([scores['f1']]).cuda())]
+        f1 = sum(f1)/len(f1)
         total_loss = [j.item() for j in get_global(local_rank, torch.tensor([scores['loss']]).cuda())]
         total_loss = sum(total_loss)/len(total_loss) 
     else:
