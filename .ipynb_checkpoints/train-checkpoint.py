@@ -324,8 +324,9 @@ if __name__=='__main__':
     weights = None
     if args.weighted_loss:
         labels = [i['label'] for i in train_dataset]
-        weights = torch.tensor([1/labels.count(0), 1/labels.count(1)])
-    args.weights = weights
+        weights = torch.tensor([1/labels.count(c) for c in range(args.n_labels)])
+    args.weights = weights.tolist() if weights is not None else weights
+        
     # save
     if args.local_rank in [-1,0]:
         with open(os.path.join(args.output_dir,'args.txt'), 'w') as f:

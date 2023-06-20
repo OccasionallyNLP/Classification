@@ -38,15 +38,18 @@ def compute_kl_loss(p:torch.tensor, q:torch.tensor):
     return loss
 
 class BinaryFocalLoss(nn.Module):
-    def __init__(self, alpha=torch.tensor([0.5,0.5]), gamma=1):
-        super(WeightedFocalLoss, self).__init__()
+    def __init__(self, alpha=None, gamma=1):
+        super().__init__()
         self.alpha = alpha
         self.gamma = gamma
 
     def forward(self, inputs, targets):
         BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
         targets = targets.type(torch.long)
-        at = self.alpha.gather(0, targets.data.view(-1))
+        if self.alpha is not None:
+            at = self.alpha.gather(0, targets.data.view(-1))
+        else:
+            at = 1
         pt = torch.exp(-BCE_loss)
         F_loss = at*(1-pt)**self.gamma * BCE_loss
         return F_loss.mean()
