@@ -107,7 +107,7 @@ def get_args():
     
     # imbalance
     parser.add_argument('--weighted_sampling', type=str2bool, default = False) # 221124 추가
-    parser.add_argument('--weighted_cross_entropy', type=str2bool, default = False) # 221124 추가
+    parser.add_argument('--weighted_loss', type=str2bool, default = False) # 221124 추가
     parser.add_argument('--focal_loss', type=str2bool, default = False) # 221124 추가
     parser.add_argument('--gamma', type=int) # 221124 추가
     
@@ -322,7 +322,7 @@ if __name__=='__main__':
     
     # binary weight
     weights = None
-    if args.weighted_cross_entropy:
+    if args.weighted_loss:
         labels = [i['label'] for i in train_dataset]
         weights = torch.tensor([1/labels.count(0), 1/labels.count(1)])
     args.weights = weights
