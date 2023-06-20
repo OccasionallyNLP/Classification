@@ -31,7 +31,6 @@ def load_data(data_path, local_rank, distributed):
     if distributed:
         world_size = torch.distributed.get_world_size()
         data = data[:len(data)//world_size*world_size]
-        data = make_index(data)
         for k, example in enumerate(data):
             if not k%world_size == local_rank:
                 continue

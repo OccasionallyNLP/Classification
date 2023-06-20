@@ -135,7 +135,7 @@ def train():
     optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.lr, weight_decay=args.decay)
     # scheduler
     t_total = len(train_dataloader)*args.epochs//args.accumulation_steps
-    n_warmup = int(t_total*args.warmup) if args.warmup<1 else args.warmup
+    n_warmup = int(t_total*args.warmup) if args.warmup<1 else int(args.warmup)
     scheduler = get_constant_schedule_with_warmup(optimizer, num_warmup_steps=n_warmup)
     if args.local_rank in [-1,0]:
         early_stop = EarlyStopping(args.patience, args.output_dir, max = args.early_stop_metric_is_max_better, min_difference=1e-5)
@@ -145,18 +145,19 @@ def train():
     ########################################################################################
     # train
     ########################################################################################
-    global_step = 1
+    global_step = 0
     train_plot = []
     val_plot = []
     for epoch in range(1, args.epochs+1):
         if args.distributed:
             train_sampler.set_epoch(epoch)
         model.train()
-        Loss = 0.
-        step = 1
+        epoch_loss = 0.
+        step = 0
         iter_bar = tqdm(train_dataloader, desc='step', disable=args.local_rank not in [-1,0])
         #train
         for data in iter_bar:
+            step+=1
             optimizer.zero_grad()            
             data = {i:j.cuda() for i,j in data.items()}
             if args.fp16:
@@ -167,15 +168,15 @@ def train():
                     scaler.scale(loss).backward()
                     if step%args.accumulation_steps==0 or (
                     len(train_dataloader) <= args.accumulation_steps
-                    and (step + 1) == len(train_dataloader)
+                    and (step) == len(train_dataloader)
             ):
                         scaler.unscale_(optimizer)
                         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
                         scaler.step(optimizer)
                         scaler.update()
-                        optimizer.zero_grad()
-                        step+=1
                         scheduler.step()
+                        optimizer.zero_grad()
+                        global_step+=1
             else:
                 output = model.forward(**data)
                 loss = calc_loss(args, output['score'], data['labels'], weights=weights)
@@ -183,24 +184,23 @@ def train():
                 loss.backward()
                 if step%args.accumulation_steps==0 or (
                     len(train_dataloader) <= args.accumulation_steps
-                    and (step + 1) == len(train_dataloader)
+                    and (step) == len(train_dataloader)
             ):
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
                     optimizer.step()
-                    optimizer.zero_grad()
-                    step+=1
                     scheduler.step()
+                    optimizer.zero_grad()
+                    global_step+=1
                     
             if args.distributed:
                 torch.distributed.reduce(loss, 0)
                 loss = loss / torch.distributed.get_world_size()
-            Loss+=loss.item()
-            iter_bar.set_postfix({'epoch':epoch, 'global_step':global_step, 'lr':f"{scheduler.get_last_lr()[0]:.5f}",'total_loss':f'{Loss/(step):.5f}'}) # 감소한다는 것을 확인하는 것임.
+            epoch_loss+=loss.item()*args.accumulation_steps
+            iter_bar.set_postfix({'epoch':epoch, 'global_step':global_step, 'step':step, 'lr':f"{scheduler.get_last_lr()[0]:.5f}",'epoch_loss':f'{epoch_loss/step:.5f}'}) 
             if global_step%args.logging_term == 0:
                 if args.local_rank in [-1,0]:
                     logger1.info(iter_bar)
                     logger2.info(iter_bar)
-            global_step+=1
             
         # epoch 당 기록.
         if args.local_rank in [-1,0]:
