@@ -134,8 +134,10 @@ def train():
     optimizer_grouped_parameters = make_optimizer_group(model, args.decay)
     optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.lr, weight_decay=args.decay)
     # scheduler
+    
     t_total = len(train_dataloader)*args.epochs//args.accumulation_steps
     n_warmup = int(t_total*args.warmup) if args.warmup<1 else args.warmup
+    print(n_warmup)
     scheduler = get_constant_schedule_with_warmup(optimizer, num_warmup_steps=n_warmup)
     if args.local_rank in [-1,0]:
         early_stop = EarlyStopping(args.patience, args.output_dir, max = args.early_stop_metric_is_max_better, min_difference=1e-5)
@@ -146,8 +148,7 @@ def train():
     # train
     ########################################################################################
     global_step = 1
-    train_plot = []
-    val_plot = []
+    
     for epoch in range(1, args.epochs+1):
         if args.distributed:
             train_sampler.set_epoch(epoch)
@@ -156,24 +157,17 @@ def train():
         step = 1
         iter_bar = tqdm(train_dataloader, desc='step', disable=args.local_rank not in [-1,0])
         #train
+        check = []
         for data in iter_bar:
             optimizer.zero_grad()            
             data = {i:j.cuda() for i,j in data.items()}
             if args.fp16:
                 with autocast():
-                    output = model.forward(**data)
-                    loss = calc_loss(args, output['score'], data['labels'], weights=weights)
-                    loss = loss / args.accumulation_steps
-                    scaler.scale(loss).backward()
+                    
                     if step%args.accumulation_steps==0 or (
                     len(train_dataloader) <= args.accumulation_steps
                     and (step + 1) == len(train_dataloader)
             ):
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
-                        scaler.step(optimizer)
-                        scaler.update()
-                        optimizer.zero_grad()
                         step+=1
                         scheduler.step()
             else:
@@ -191,61 +185,14 @@ def train():
                     step+=1
                     scheduler.step()
                     
-            if args.distributed:
-                torch.distributed.reduce(loss, 0)
-                loss = loss / torch.distributed.get_world_size()
-            Loss+=loss.item()
-            iter_bar.set_postfix({'epoch':epoch, 'global_step':global_step, 'lr':f"{scheduler.get_last_lr()[0]:.5f}",'total_loss':f'{Loss/(step):.5f}'}) # 감소한다는 것을 확인하는 것임.
+            check.append(scheduler.get_last_lr()[0])
+            iter_bar.set_postfix({'global_step':global_step, 'lr':f"{scheduler.get_last_lr()[0]:.3f}"}) 
             if global_step%args.logging_term == 0:
                 if args.local_rank in [-1,0]:
                     logger1.info(iter_bar)
                     logger2.info(iter_bar)
             global_step+=1
             
-        # epoch 당 기록.
-        if args.local_rank in [-1,0]:
-            logger1.info(iter_bar)
-            logger2.info(iter_bar)
-        ########################################################################################
-        # evaluation
-        ###################################################################################################
-        if args.eval_epoch!=0 and epoch%args.eval_epoch==0:
-            # train
-            train_scores_ = evaluation(args, model, tokenizer, train_dataloader)
-            train_scores = get_scores(args.local_rank, train_scores_, args.distributed)            
-            
-            # validation
-            val_scores_ = evaluation(args, model, tokenizer, val_dataloader)
-            val_scores = get_scores(args.local_rank, val_scores_, args.distributed)            
-            
-            if args.local_rank in [-1,0]:
-                logger1.info(f'Train ---- epoch : {epoch} ----- scores:{train_scores}')
-                logger2.info(f'Train ---- epoch : {epoch} ----- scores:{train_scores}')
-                logger1.info(f'Val ---- epoch : {epoch} ----- scores:{val_scores}')
-                logger2.info(f'Val ---- epoch : {epoch} ----- scores:{val_scores}')
-                model_to_save = model.module if hasattr(model,'module') else model
-                if args.save_model_every_epoch:
-                    torch.save(model_to_save, os.path.join(args.output_dir,'model_%d'%epoch))
-                    # torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
-                    # torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
-                early_stop.check(model_to_save, val_scores[args.early_stop_metric])  
-                if early_stop.timetobreak:
-                    flag_tensor += 1
-            if args.distributed:
-                torch.distributed.broadcast(flag_tensor, 0) 
-                torch.distributed.barrier()
-        ###################################################################################################
-        if args.early_stop:    
-            if flag_tensor:
-                if args.local_rank in [-1,0]:
-                    logger1.info('early stop')
-                    logger2.info('early stop')
-                break
-    # 저장시 - gpu 0번 것만 저장 - barrier 필수
-    if args.local_rank in [-1,0]:
-        torch.save(early_stop.best_model, os.path.join(early_stop.save_dir,'best_model'))
-        logger1.info('train_end')
-        logger2.info('train end')
 
 def get_tokenizer_and_model(args):
     tokenizer = AutoTokenizer.from_pretrained(args.ptm_path)
@@ -254,14 +201,11 @@ def get_tokenizer_and_model(args):
         model_class = BertModel
     elif 'roberta' in args.ptm_path:
         model_class = RobertaModel
-    elif 'ulm' in args.ptm_path:
+    elif 't5' in args.ptm_path:
         model_class = T5EncoderModel
     model = ClassificationModel(config, args.pool, model_class, args.n_labels)
     if args.model_path is None:
-        if 'ulm' in args.ptm_path:
-            backbone_model = T5EncoderModel.from_pretrained(args.ptm_path)
-        else:
-            backbone_model = AutoModel.from_pretrained(args.ptm_path)
+        backbone_model = AutoModel.from_pretrained(args.ptm_path)
         model.init_pretrained_model(backbone_model.state_dict())
     else:
         model_state_dict = torch.load(args.model_path, map_location='cpu')

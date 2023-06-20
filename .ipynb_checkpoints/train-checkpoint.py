@@ -254,11 +254,14 @@ def get_tokenizer_and_model(args):
         model_class = BertModel
     elif 'roberta' in args.ptm_path:
         model_class = RobertaModel
-    elif 't5' in args.ptm_path:
+    elif 'ulm' in args.ptm_path:
         model_class = T5EncoderModel
     model = ClassificationModel(config, args.pool, model_class, args.n_labels)
     if args.model_path is None:
-        backbone_model = AutoModel.from_pretrained(args.ptm_path)
+        if 'ulm' in args.ptm_path:
+            backbone_model = T5EncoderModel.from_pretrained(args.ptm_path)
+        else:
+            backbone_model = AutoModel.from_pretrained(args.ptm_path)
         model.init_pretrained_model(backbone_model.state_dict())
     else:
         model_state_dict = torch.load(args.model_path, map_location='cpu')
