@@ -67,18 +67,15 @@ def evaluation(args, model, tokenizer, eval_dataloader):
     return dict(loss=total_loss/len(eval_dataloader), acc=acc, f1=f1)
 
 def get_scores(local_rank, scores, distributed:bool):
+    output = {}
     if distributed:
-        acc = [j.item() for j in get_global(local_rank, torch.tensor([scores['acc']]).cuda())]
-        acc = sum(acc)/len(acc)
-        f1 = [j.item() for j in get_global(local_rank, torch.tensor([scores['f1']]).cuda())]
-        f1 = sum(f1)/len(f1)
-        total_loss = [j.item() for j in get_global(local_rank, torch.tensor([scores['loss']]).cuda())]
-        total_loss = sum(total_loss)/len(total_loss) 
+        for i,j in scores.items():
+            tmp = [j.item() for j in get_global(local_rank, torch.tensor([j]).cuda())]
+            output[i] = np.round(sum(tmp)/len(tmp),4)
     else:
-        acc = scores['acc']
-        f1 = scores['f1']
-        total_loss = scores['loss']
-    return dict(loss=np.round(total_loss,3), acc=np.round(acc,3), f1 = np.round(f1, 3))
+        for i,j in scores.items():
+            output[i] = np.round(j,4)
+    return output
 
 def get_args():
     # parser
@@ -327,6 +324,7 @@ if __name__=='__main__':
         weights = [1/labels.count(c) for c in range(args.n_labels)]
         if args.n_labels == 1:
             weights = weights.append(1/labels.count(1))
+        weights = torch.tensor(weights)
     args.weights = weights.tolist() if weights is not None else weights
         
     # save

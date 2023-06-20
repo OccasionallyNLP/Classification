@@ -22,18 +22,24 @@ from model import *
 from losses import *
 from sklearn.metrics import accuracy_score, f1_score
 
+from losses import *
+from sklearn.metrics import accuracy_score, f1_score
+
 def calc_loss(args, logits, labels, weights=None):
     # label에 따른 차이가 필요함.
+    if weights is not None:
+        weights = weights.to(labels)
     if args.n_labels != 1:
-        if args.weighted_cross_entropy:
-            loss_fn = nn.CrossEntropyLoss(weight=weights.to(labels))
             # just for binary classification
-        elif args.focal_loss:
-            loss_fn = FocalLoss(args.gamma)
+        if args.focal_loss:
+            loss_fn = FocalLoss(args.gamma, weights)
         else:
-            loss_fn = nn.CrossEntropyLoss()
+            loss_fn = nn.CrossEntropyLoss(weight=weights)
     else:
-        loss_fn = torch.nn.BCEWithLogitsLoss()
+        if args.focal_loss:
+            loss_fn = BinaryFocalLoss(weights, args.gamma)
+        else:
+            loss_fn = torch.nn.BCEWithLogitsLoss()
         logits = logits.squeeze(1)
         labels = labels.float()
     loss = loss_fn(logits, labels)
@@ -45,24 +51,24 @@ def evaluation(args, model, tokenizer, eval_dataloader):
     model.eval()
     predicts = []
     actuals = []
+    logits = []
     with torch.no_grad():
         for data in tqdm(eval_dataloader, desc = 'evaluate', disable =  args.local_rank not in [-1,0]):
             data = {i:j.cuda() for i,j in data.items()}
             output = model.forward(**data)
-            if output.get('loss') is not None:
-                loss = calc_loss(args, output['score'], labels, weights=weights)
-                total_loss+=loss
+            loss = calc_loss(args, output['score'], data['labels'], weights=weights)
+            total_loss+=loss
             if args.n_labels == 1:
-                predict = (torch.sigmoid(output['score'])>=0.5).long().cpu().tolist()
+                predict = (torch.sigmoid(output['score'])>=0.5).squeeze(1).long().cpu().tolist()
             else:
                 predict = output['score'].argmax(dim=-1).cpu().tolist()
+            logits.append(output['score'].cpu().tolist())
             actual = data['labels'].cpu().tolist()
             predicts.extend(predict)
             actuals.extend(actual)
     acc = accuracy_score(actuals, predicts)
     f1 = f1_score(actuals, predicts, average='weighted')
-    cnt = len(predicts)
-    return dict(loss=total_loss/len(eval_dataloader), acc=acc, f1=f1, cnt=cnt), predicts, actuals
+    return dict(loss=total_loss/len(eval_dataloader), acc=acc, f1=f1), predicts, actuals, logits
 
 def get_args():
     # parser
@@ -106,13 +112,13 @@ def get_tokenizer_and_model(args):
     return tokenizer, model 
 
 def synchronize(args, check_point_args):
-    args.weight = check_point_args['weight']
-    args.weighted_cross_entropy = check_point_args['weighted_cross_entropy']
+    args.weight = check_point_args['weights']
+    args.weighted_cross_entropy = check_point_args['weighted_loss']
     args.focal_loss = check_point_args['focal_loss']
     args.gamma = check_point_args['gamma']
-    args.ptm_path = check_point_args['ptm_path']
     args.pool = check_point_args['pool']
     args.n_labels = check_point_args['n_labels']
+    args.ptm_path = check_point_args['ptm_path']
     args.model_path = os.path.join(check_point_args['output_dir'],'best_model')
     return args
 
@@ -153,7 +159,7 @@ if __name__=='__main__':
     test_sampler = SequentialSampler(test_dataset)
     test_dataloader = DataLoader(test_dataset, batch_size = args.batch_size, sampler = test_sampler, collate_fn = test_dataset.collate_fn)
     
-    scores, predicts, actuals = evaluation(args, model, tokenizer, test_dataloader)
+    scores, predicts, actuals, logits = evaluation(args, model, tokenizer, test_dataloader)
     print(scores)
     ###########################################################################################
     

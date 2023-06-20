@@ -22,6 +22,7 @@ from utils.utils import *
 from model import *
 from losses import *
 from sklearn.metrics import accuracy_score, f1_score
+from collections import defaultdict
 
 def calc_loss(args, logits, labels, weights=None):
     # label에 따른 차이가 필요함.
@@ -47,35 +48,46 @@ def calc_loss(args, logits, labels, weights=None):
 def evaluation(args, model, tokenizer, eval_dataloader):
     total_loss = 0.
     model.eval()
-    predicts = []
-    actuals = []
+    predicts = defaultdict(list)
+    actuals = defaultdict(list)
     with torch.no_grad():
         for data in tqdm(eval_dataloader, desc = 'evaluate', disable =  args.local_rank not in [-1,0]):
             data = {i:j.cuda() for i,j in data.items()}
             output = model.forward(**data)
-            loss = calc_loss(args, output['score'], data['labels'], weights=weights)
+            losses = dict()
+            for k in range(len(args.n_labels)):
+                losses[k] = calc_loss(args, output['score_%d'%k], data['labels_%d'%k], weights=weights[k]) # TODO - weights를 list로
+            loss = summation(losses.values())
             total_loss+=loss
-            if args.n_labels == 1:
-                predict = (torch.sigmoid(output['score'])>=0.5).squeeze(1).long().cpu().tolist()
-            else:
-                predict = output['score'].argmax(dim=-1).cpu().tolist()
-            actual = data['labels'].cpu().tolist()
-            predicts.extend(predict)
-            actuals.extend(actual)
-    acc = accuracy_score(actuals, predicts)
-    f1 = f1_score(actuals, predicts, average='weighted')
-    return dict(loss=total_loss/len(eval_dataloader), acc=acc, f1=f1)
+            # predicts가 여러개임.
+            
+            for _,k in enumerate(args.n_labels):
+                if k == 1:
+                    predict = (torch.sigmoid(output['score_%d'%k])>=0.5).squeeze(1).long().cpu().tolist()
+                else:
+                    predict = output['score_%d'%k].argmax(dim=-1).cpu().tolist()
+                actual = data['labels_%d'%k].cpu().tolist()
+                predicts[_].extend(predict)
+                actuals[_].extend(actual)
+    acc = {k:accuracy_score(actuals[k], predicts[k]) for k in range(len(args.n_labels))} 
+    f1 = {k:f1_score(actuals[k], predicts[k], average='weighted') for k in range(len(args.n_labels))} 
+    results = dict(loss=total_loss/len(eval_dataloader))
+    for a,b in acc.items():
+        results['acc_%d'%a]=b
+    for a,b in f1.items():
+        results['f1_%d'%a]=b
+    return results
 
 def get_scores(local_rank, scores, distributed:bool):
-    output = {}
+    results = {}
     if distributed:
         for i,j in scores.items():
-            tmp = [j.item() for j in get_global(local_rank, torch.tensor([j]).cuda())]
-            output[i] = np.round(sum(tmp)/len(tmp),4)
+            tmp = [j.item() for j in get_global(local_rank, torch.tensor([scores[i]]).cuda())]
+            results[i] = np.round(sum(tmp) / len(tmp),3)
     else:
         for i,j in scores.items():
-            output[i] = np.round(j,4)
-    return output
+            results[i] = np.round(j,3)
+    return results
 
 def get_args():
     # parser
@@ -103,7 +115,6 @@ def get_args():
     parser.add_argument('--fp16', type=str2bool, default = True)
     
     # imbalance
-    parser.add_argument('--weighted_sampling', type=str2bool, default = False) # 221124 추가
     parser.add_argument('--weighted_loss', type=str2bool, default = False) # 221124 추가
     parser.add_argument('--focal_loss', type=str2bool, default = False) # 221124 추가
     parser.add_argument('--gamma', type=int) # 221124 추가
@@ -127,6 +138,15 @@ def get_args():
     
     args  = parser.parse_args()
     return args
+
+def summation(b):
+    a = None
+    for i in b:
+        if a is None:
+            a = i
+        else:
+            a+=i
+    return a
 
 def train():
     # optimizer
@@ -162,7 +182,10 @@ def train():
             if args.fp16:
                 with autocast():
                     output = model.forward(**data)
-                    loss = calc_loss(args, output['score'], data['labels'], weights=weights)
+                    losses = dict()
+                    for k in range(len(args.n_labels)):
+                        losses[k] = calc_loss(args, output['score_%d'%k], data['labels_%d'%k], weights=weights[k]) # TODO - weights를 list로
+                    loss = summation(losses.values())
                     loss = loss / args.accumulation_steps
                     scaler.scale(loss).backward()
                     if step%args.accumulation_steps==0 or (
@@ -178,7 +201,10 @@ def train():
                         global_step+=1
             else:
                 output = model.forward(**data)
-                loss = calc_loss(args, output['score'], data['labels'], weights=weights)
+                losses = dict()
+                for k in range(len(args.n_labels)):
+                    losses[k] = calc_loss(args, output['score_%d'%k], data['labels_%d'%k], weights=weights[k]) # TODO - weights를 list로
+                loss = summation(losses.values())
                 loss = loss / args.accumulation_steps
                 loss.backward()
                 if step%args.accumulation_steps==0 or (
@@ -255,7 +281,7 @@ def get_tokenizer_and_model(args):
         model_class = RobertaModel
     elif 'ulm' in args.ptm_path:
         model_class = T5EncoderModel
-    model = ClassificationModel(config, args.pool, model_class, args.n_labels)
+    model = MTClassificationModel(config, args.pool, model_class, args.n_labels)
     if args.model_path is None:
         if 'ulm' in args.ptm_path:
             backbone_model = T5EncoderModel.from_pretrained(args.ptm_path)
@@ -270,13 +296,13 @@ def get_tokenizer_and_model(args):
 def load_datasets(args, tokenizer):
     # LOAD DATASETS
     train_data = load_jsonl(args.train_data)
-    train_dataset = ClassificationDataset(train_data, tokenizer, args.max_length)
+    train_dataset = MTClassificationDataset(train_data, tokenizer, args.max_length, args.n_labels)
     if args.distributed:
         # OK - legacy
         val_data = load_data(args.val_data, args.local_rank, args.distributed)
     else:
         val_data = load_jsonl(args.val_data)
-    val_dataset = ClassificationDataset(val_data, tokenizer, args.max_length)
+    val_dataset = MTClassificationDataset(val_data, tokenizer, args.max_length, args.n_labels)
     return train_dataset, val_dataset
         
         
@@ -318,33 +344,26 @@ if __name__=='__main__':
     train_dataset, val_dataset = load_datasets(args, tokenizer)
     
     # binary weight
-    weights = None
+    # TODO
+    weights = dict()
     if args.weighted_loss:
-        labels = [i['label'] for i in train_dataset]
-        weights = [1/labels.count(c) for c in range(args.n_labels)]
-        if args.n_labels == 1:
-            weights = weights.append(1/labels.count(1))
-        weights = torch.tensor(weights)
-    args.weights = weights.tolist() if weights is not None else weights
-        
+        for k in range(len(args.n_labels)):
+            weight = None
+            labels = [i['label_%d'%k] for i in train_dataset]
+            weight = [1/labels.count(c) for c in range(args.n_labels[k])]
+            if args.n_labels[k] == 1:
+                weight = weight.append(1/labels.count(1))
+            weight = torch.tensor(weight)
+            weights[k]= weight 
+    args.weights = {i:j.tolist() if j is not None else j for i,j in weights.items()}
     # save
     if args.local_rank in [-1,0]:
         with open(os.path.join(args.output_dir,'args.txt'), 'w') as f:
             json.dump(args.__dict__, f, indent=2)
-    # weighted_sampling & distributed
-    if args.weighted_sampling:
-        if args.distributed:
-            train_sampler = DistributedWeightedRandomSampler(train_dataset, replacement=True)
-        else:
-            n_class = Counter([i['label'] for i in train_dataset]) 
-            class_weight = {i:1/j for i,j in n_class.items()}
-            weight =  torch.DoubleTensor([class_weight[i['label']] for i in train_dataset])
-            train_sampler = WeightedRandomSampler(weight, len(train_dataset), replacement=True)
+    if args.distributed:
+        train_sampler = DistributedSampler(train_dataset) 
     else:
-        if args.distributed:
-            train_sampler = DistributedSampler(train_dataset) 
-        else:
-            train_sampler = RandomSampler(train_dataset)
+        train_sampler = RandomSampler(train_dataset)
    
     train_dataloader = DataLoader(train_dataset,batch_size = args.batch_size, sampler = train_sampler, collate_fn = train_dataset.collate_fn)
     val_sampler = SequentialSampler(val_dataset)
