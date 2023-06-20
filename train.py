@@ -14,12 +14,11 @@ from torch.utils.data import Dataset, DataLoader, DistributedSampler, RandomSamp
 from torch.cuda.amp import autocast
 from torch.cuda.amp import GradScaler
 import numpy as np
-from transformers import AutoTokenizer, AutoModel, AutoConfig, BertModel, RobertaModel
+from transformers import AutoTokenizer, AutoModel, AutoConfig, BertModel, RobertaModel, T5EncoderModel, get_constant_schedule_with_warmup
 import argparse
 from utils.data_utils import *
 from utils.distributed_utils import *
 from utils.utils import *
-from utils.metrics import *
 from model import *
 from losses import *
 from sklearn.metrics import accuracy_score, f1_score
@@ -36,6 +35,8 @@ def calc_loss(args, logits, labels, weights=None):
             loss_fn = nn.CrossEntropyLoss()
     else:
         loss_fn = torch.nn.BCEWithLogitsLoss()
+        logits = logits.squeeze(1)
+        labels = labels.float()
     loss = loss_fn(logits, labels)
     return loss
 
@@ -50,32 +51,32 @@ def evaluation(args, model, tokenizer, eval_dataloader):
             data = {i:j.cuda() for i,j in data.items()}
             output = model.forward(**data)
             if output.get('loss') is not None:
-                loss = calc_loss(args, output['score'], labels, weights=weights)
+                loss = calc_loss(args, output['score'], data['labels'], weights=weights)
                 total_loss+=loss
             if args.n_labels == 1:
-                predict = (F.sigmoid(output['score'])>=0.5).long().cpu().tolist()
+                predict = (torch.sigmoid(output['score'])>=0.5).squeeze(1).long().cpu().tolist()
             else:
                 predict = output['score'].argmax(dim=-1).cpu().tolist()
             actual = data['labels'].cpu().tolist()
             predicts.extend(predict)
             actuals.extend(actual)
     acc = accuracy_score(actuals, predicts)
-    f1_score = f1_score(actuals, predicts, average='weighted')
+    f1 = f1_score(actuals, predicts, average='weighted')
     cnt = len(predicts)
-    return dict(loss=total_loss/len(eval_dataloader), acc=acc, f1_score=f1_score, cnt=cnt)
+    return dict(loss=total_loss/len(eval_dataloader), acc=acc, f1=f1, cnt=cnt)
 
 def get_scores(local_rank, scores, distributed:bool):
     if distributed:
         cnt = sum([j.item() for j in get_global(local_rank, torch.tensor([scores['cnt']]).cuda())])
         acc = sum([j.item() for j in get_global(local_rank, torch.tensor([scores['acc']]).cuda())])
-        f1_score = sum([j.item() for j in get_global(local_rank, torch.tensor([scores['f1_score']]).cuda())])
+        f1 = sum([j.item() for j in get_global(local_rank, torch.tensor([scores['f1']]).cuda())])
         total_loss = [j.item() for j in get_global(local_rank, torch.tensor([scores['loss']]).cuda())]
         total_loss = sum(total_loss)/len(total_loss) 
     else:
         acc = scores['acc']
-        f1_score = scores['f1_score']
+        f1 = scores['f1']
         total_loss = scores['loss']
-    return dict(loss=np.round(total_loss,3), acc=np.round(acc,3), f1_score = np.round(f1_score, 3))
+    return dict(loss=np.round(total_loss,3), acc=np.round(acc,3), f1 = np.round(f1, 3))
 
 def get_args():
     # parser
@@ -133,7 +134,9 @@ def train():
     optimizer_grouped_parameters = make_optimizer_group(model, args.decay)
     optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.lr, weight_decay=args.decay)
     # scheduler
-    scheduler = get_linear_scheduler(len(train_dataloader)*args.epochs//args.accumulation_steps, args.warmup, optimizer, train_dataloader)
+    t_total = len(train_dataloader)*args.epochs//args.accumulation_steps
+    n_warmup = int(t_total*args.warmup) if args.warmup<1 else args.warmup
+    scheduler = get_constant_schedule_with_warmup(optimizer, num_warmup_steps=n_warmup)
     if args.local_rank in [-1,0]:
         early_stop = EarlyStopping(args.patience, args.output_dir, max = args.early_stop_metric_is_max_better, min_difference=1e-5)
     if args.fp16:
@@ -158,7 +161,8 @@ def train():
             data = {i:j.cuda() for i,j in data.items()}
             if args.fp16:
                 with autocast():
-                    loss = calc_loss(args, output['score'], labels, weights=weights)
+                    output = model.forward(**data)
+                    loss = calc_loss(args, output['score'], data['labels'], weights=weights)
                     loss = loss / args.accumulation_steps
                     scaler.scale(loss).backward()
                     if step%args.accumulation_steps==0 or (
@@ -173,7 +177,8 @@ def train():
                         step+=1
                         scheduler.step()
             else:
-                loss = calc_loss(args, output['score'], labels, weights=weights)
+                output = model.forward(**data)
+                loss = calc_loss(args, output['score'], data['labels'], weights=weights)
                 loss = loss / args.accumulation_steps
                 loss.backward()
                 if step%args.accumulation_steps==0 or (

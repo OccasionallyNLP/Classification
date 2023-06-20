@@ -25,15 +25,19 @@ def load_jsonl(path):
         result.append(json.loads(i))
     return result 
 
-def get_linear_scheduler(total, warmup, optimizer, dataloader):
-    total_step = len(dataloader)*total
-    if int(warmup)>=1:
-        scheduler = lambda step: min(1/warmup*step,1.)
-    else:
-        scheduler = lambda step: min(warmup*step,1.)
-        
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda = scheduler)
-    return scheduler
+def load_data(data_path, local_rank, distributed):
+    data = load_jsonl(data_path)
+    samples = []
+    if distributed:
+        world_size = torch.distributed.get_world_size()
+        data = data[:len(data)//world_size*world_size]
+        data = make_index(data)
+        for k, example in enumerate(data):
+            if not k%world_size == local_rank:
+                continue
+            samples.append(example)
+        return samples
+    return data
 
 def make_optimizer_group(model, decay):
     param_optimizer = list(model.named_parameters())

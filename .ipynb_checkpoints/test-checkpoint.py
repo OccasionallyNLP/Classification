@@ -18,7 +18,6 @@ import argparse
 from utils.data_utils import *
 from utils.distributed_utils import *
 from utils.utils import *
-from utils.metrics import *
 from model import *
 from losses import *
 from sklearn.metrics import accuracy_score, f1_score
@@ -35,6 +34,8 @@ def calc_loss(args, logits, labels, weights=None):
             loss_fn = nn.CrossEntropyLoss()
     else:
         loss_fn = torch.nn.BCEWithLogitsLoss()
+        logits = logits.squeeze(1)
+        labels = labels.float()
     loss = loss_fn(logits, labels)
     return loss
 
@@ -52,16 +53,16 @@ def evaluation(args, model, tokenizer, eval_dataloader):
                 loss = calc_loss(args, output['score'], labels, weights=weights)
                 total_loss+=loss
             if args.n_labels == 1:
-                predict = (F.sigmoid(output['score'])>=0.5).long().cpu().tolist()
+                predict = (torch.sigmoid(output['score'])>=0.5).long().cpu().tolist()
             else:
                 predict = output['score'].argmax(dim=-1).cpu().tolist()
             actual = data['labels'].cpu().tolist()
             predicts.extend(predict)
             actuals.extend(actual)
     acc = accuracy_score(actuals, predicts)
-    f1_score = f1_score(actuals, predicts, average='weighted')
+    f1 = f1_score(actuals, predicts, average='weighted')
     cnt = len(predicts)
-    return dict(loss=total_loss/len(eval_dataloader), acc=acc, f1_score=f1_score, cnt=cnt), predicts, actuals
+    return dict(loss=total_loss/len(eval_dataloader), acc=acc, f1=f1, cnt=cnt), predicts, actuals
 
 def get_args():
     # parser

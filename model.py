@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 from typing import List, Dict, Optional
-from transformers import PreTrainedModel
+from transformers import PreTrainedModel, T5EncoderModel
 from dataclasses import dataclass
 
 # point wise - classification
