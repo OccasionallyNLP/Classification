@@ -57,7 +57,7 @@ def evaluation(args, model, tokenizer, eval_dataloader):
             data = {i:j.cuda() for i,j in data.items()}
             output = model.forward(**data)
             loss = calc_loss(args, output['score'], data['labels'], weights=weights)
-            total_loss+=loss
+            total_loss+=loss.item()
             if args.n_labels == 1:
                 predict = (torch.sigmoid(output['score'])>=0.5).squeeze(1).long().cpu().tolist()
             else:
