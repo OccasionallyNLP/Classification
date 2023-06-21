@@ -59,12 +59,12 @@ class MTClassificationDataset(Dataset):
         labels = defaultdict(list)
         for b in batch:
             inputs.append(b['input'])
-            for k in range(len(n_labels)):
+            for k in range(len(self.n_labels)):
                 labels[k].append(b['label_%d'%k])
         if self.max_length is None:
             inputs = self.tokenizer(inputs, padding='longest',return_tensors = 'pt')
         else:
             inputs = self.tokenizer(inputs, padding=True, truncation=True, max_length=self.max_length, return_tensors = 'pt')
-        for k in range(len(n_labels)):
+        for k in range(len(self.n_labels)):
             inputs.data['labels_%d'%k]=torch.tensor(labels[k])
         return inputs
