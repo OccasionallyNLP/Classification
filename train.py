@@ -323,7 +323,7 @@ if __name__=='__main__':
         labels = [i['label'] for i in train_dataset]
         weights = [1/labels.count(c) for c in range(args.n_labels)]
         if args.n_labels == 1:
-            weights = weights.append(1/labels.count(1))
+            weights.append(1/labels.count(1))
         weights = torch.tensor(weights)
     args.weights = weights.tolist() if weights is not None else weights
         
