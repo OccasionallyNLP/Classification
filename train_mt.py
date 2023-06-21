@@ -56,7 +56,7 @@ def evaluation(args, model, tokenizer, eval_dataloader):
             output = model.forward(**data)
             losses = dict()
             for k in range(len(args.n_labels)):
-                losses[k] = calc_loss(args, output['score_%d'%k], data['labels_%d'%k], weights=weights[k]) # TODO - weights를 list로
+                losses[k] = calc_loss(args, output['score_%d'%k], data['labels_%d'%k], weights=weights[k]).item() # TODO - weights를 list로
             loss = summation(losses.values())
             total_loss+=loss
             # predicts가 여러개임.
