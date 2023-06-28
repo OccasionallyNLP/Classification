@@ -53,7 +53,7 @@ def evaluation(args, model, tokenizer, eval_dataloader):
         for data in tqdm(eval_dataloader, desc = 'evaluate', disable =  args.local_rank not in [-1,0]):
             data = {i:j.cuda() for i,j in data.items()}
             output = model.forward(**data)
-            loss = calc_loss(args, output['score'], data['labels'], weights=weights)
+            loss = calc_loss(args, output['score'], data['labels'], weights=args.weights)
             total_loss+=loss
             if args.n_labels == 1:
                 predict = (torch.sigmoid(output['score'])>=0.5).squeeze(1).long().cpu().tolist()
@@ -162,7 +162,7 @@ def train():
             if args.fp16:
                 with autocast():
                     output = model.forward(**data)
-                    loss = calc_loss(args, output['score'], data['labels'], weights=weights)
+                    loss = calc_loss(args, output['score'], data['labels'], weights=args.weights)
                     loss = loss / args.accumulation_steps
                     scaler.scale(loss).backward()
                     if step%args.accumulation_steps==0 or (
@@ -178,7 +178,7 @@ def train():
                         global_step+=1
             else:
                 output = model.forward(**data)
-                loss = calc_loss(args, output['score'], data['labels'], weights=weights)
+                loss = calc_loss(args, output['score'], data['labels'], weights=args.weights)
                 loss = loss / args.accumulation_steps
                 loss.backward()
                 if step%args.accumulation_steps==0 or (
@@ -331,6 +331,7 @@ if __name__=='__main__':
     if args.local_rank in [-1,0]:
         with open(os.path.join(args.output_dir,'args.txt'), 'w') as f:
             json.dump(args.__dict__, f, indent=2)
+    args.weights = torch.tensor(args.weights)
     # weighted_sampling & distributed
     if args.weighted_sampling:
         if args.distributed:

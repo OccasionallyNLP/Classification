@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, DistributedSampler, RandomSampler, SequentialSampler
 import numpy as np
-from transformers import AutoTokenizer, T5Tokenizer, T5EncoderModel, T5Config
+from transformers import AutoTokenizer, BertModel, RobertaModel,T5EncoderModel, AutoConfig, AutoModel
 import argparse
 from utils.data_utils import *
 from utils.distributed_utils import *
@@ -56,8 +56,8 @@ def evaluation(args, model, tokenizer, eval_dataloader):
         for data in tqdm(eval_dataloader, desc = 'evaluate', disable =  args.local_rank not in [-1,0]):
             data = {i:j.cuda() for i,j in data.items()}
             output = model.forward(**data)
-            loss = calc_loss(args, output['score'], data['labels'], weights=weights)
-            total_loss+=loss
+            loss = calc_loss(args, output['score'], data['labels'], weights=args.weights)
+            total_loss+=loss.item()
             if args.n_labels == 1:
                 predict = (torch.sigmoid(output['score'])>=0.5).squeeze(1).long().cpu().tolist()
             else:
@@ -112,7 +112,7 @@ def get_tokenizer_and_model(args):
     return tokenizer, model 
 
 def synchronize(args, check_point_args):
-    args.weight = check_point_args['weights']
+    args.weight = torch.tensor(check_point_args['weights']) if check_point_args['weights'] is not None else check_point_args['weights'] 
     args.weighted_cross_entropy = check_point_args['weighted_loss']
     args.focal_loss = check_point_args['focal_loss']
     args.gamma = check_point_args['gamma']
