@@ -56,7 +56,7 @@ def evaluation(args, model, tokenizer, eval_dataloader):
             output = model.forward(**data)
             losses = dict()
             for k in range(len(args.n_labels)):
-                losses[k] = calc_loss(args, output['score_%d'%k], data['labels_%d'%k], weights=weights[k]) # TODO - weights를 list로
+                losses[k] = calc_loss(args, output['score_%d'%k], data['labels_%d'%k], weights=weights[k]).item() # TODO - weights를 list로
             loss = summation(losses.values())
             total_loss+=loss
             # predicts가 여러개임.
@@ -352,7 +352,7 @@ if __name__=='__main__':
             labels = [i['label_%d'%k] for i in train_dataset]
             weight = [1/labels.count(c) for c in range(args.n_labels[k])]
             if args.n_labels[k] == 1:
-                weight = weight.append(1/labels.count(1))
+                weight.append(1/labels.count(1))
             weight = torch.tensor(weight)
             weights[k]= weight 
     args.weights = {i:j.tolist() if j is not None else j for i,j in weights.items()}
