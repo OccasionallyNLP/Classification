@@ -14,34 +14,12 @@ from torch.utils.data import Dataset, DataLoader, DistributedSampler, RandomSamp
 from torch.cuda.amp import autocast
 from torch.cuda.amp import GradScaler
 import numpy as np
-from transformers import AutoTokenizer, AutoModel, AutoConfig, BertModel, RobertaModel, T5EncoderModel, get_constant_schedule_with_warmup
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, get_constant_schedule_with_warmup
 import argparse
 from utils.data_utils import *
 from utils.distributed_utils import *
 from utils.utils import *
-from model import *
-from losses import *
 from sklearn.metrics import accuracy_score, f1_score
-
-def calc_loss(args, logits, labels, weights=None):
-    # label에 따른 차이가 필요함.
-    if weights is not None:
-        weights = weights.to(labels)
-    if args.n_labels != 1:
-            # just for binary classification
-        if args.focal_loss:
-            loss_fn = FocalLoss(args.gamma, weights)
-        else:
-            loss_fn = nn.CrossEntropyLoss(weight=weights)
-    else:
-        if args.focal_loss:
-            loss_fn = BinaryFocalLoss(weights, args.gamma)
-        else:
-            loss_fn = torch.nn.BCEWithLogitsLoss()
-        logits = logits.squeeze(1)
-        labels = labels.float()
-    loss = loss_fn(logits, labels)
-    return loss
 
 # evaluation
 def evaluation(args, model, tokenizer, eval_dataloader):
@@ -53,12 +31,9 @@ def evaluation(args, model, tokenizer, eval_dataloader):
         for data in tqdm(eval_dataloader, desc = 'evaluate', disable =  args.local_rank not in [-1,0]):
             data = {i:j.cuda() for i,j in data.items()}
             output = model.forward(**data)
-            loss = calc_loss(args, output['score'], data['labels'], weights=args.weights)
-            total_loss+=loss
-            if args.n_labels == 1:
-                predict = (torch.sigmoid(output['score'])>=0.5).squeeze(1).long().cpu().tolist()
-            else:
-                predict = output['score'].argmax(dim=-1).cpu().tolist()
+            loss = output.loss
+            total_loss+=loss.item()
+            predict = output.logits.argmax(dim=-1).cpu().tolist()
             actual = data['labels'].cpu().tolist()
             predicts.extend(predict)
             actuals.extend(actual)
@@ -102,16 +77,9 @@ def get_args():
     # 경량화
     parser.add_argument('--fp16', type=str2bool, default = True)
     
-    # imbalance
-    parser.add_argument('--weighted_sampling', type=str2bool, default = False) # 221124 추가
-    parser.add_argument('--weighted_loss', type=str2bool, default = False) # 221124 추가
-    parser.add_argument('--focal_loss', type=str2bool, default = False) # 221124 추가
-    parser.add_argument('--gamma', type=int) # 221124 추가
-    
     # PTM model
     parser.add_argument('--ptm_path', type=str)
     parser.add_argument('--model_path', type=str)
-    parser.add_argument('--pool', type=str, default = 'cls')
     
     # model input
     parser.add_argument('--max_length', type=int)
@@ -162,7 +130,7 @@ def train():
             if args.fp16:
                 with autocast():
                     output = model.forward(**data)
-                    loss = calc_loss(args, output['score'], data['labels'], weights=args.weights)
+                    loss = output.loss
                     loss = loss / args.accumulation_steps
                     scaler.scale(loss).backward()
                     if step%args.accumulation_steps==0 or (
@@ -178,7 +146,7 @@ def train():
                         global_step+=1
             else:
                 output = model.forward(**data)
-                loss = calc_loss(args, output['score'], data['labels'], weights=args.weights)
+                loss = output.loss
                 loss = loss / args.accumulation_steps
                 loss.backward()
                 if step%args.accumulation_steps==0 or (
@@ -209,24 +177,18 @@ def train():
         # evaluation
         ###################################################################################################
         if args.eval_epoch!=0 and epoch%args.eval_epoch==0:
-            # train
-            train_scores_ = evaluation(args, model, tokenizer, train_dataloader)
-            train_scores = get_scores(args.local_rank, train_scores_, args.distributed)            
-            
             # validation
             val_scores_ = evaluation(args, model, tokenizer, val_dataloader)
             val_scores = get_scores(args.local_rank, val_scores_, args.distributed)            
             
             if args.local_rank in [-1,0]:
-                logger1.info(f'Train ---- epoch : {epoch} ----- scores:{train_scores}')
-                logger2.info(f'Train ---- epoch : {epoch} ----- scores:{train_scores}')
                 logger1.info(f'Val ---- epoch : {epoch} ----- scores:{val_scores}')
                 logger2.info(f'Val ---- epoch : {epoch} ----- scores:{val_scores}')
                 model_to_save = model.module if hasattr(model,'module') else model
                 if args.save_model_every_epoch:
                     torch.save(model_to_save, os.path.join(args.output_dir,'model_%d'%epoch))
-                    # torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
-                    # torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
+                    torch.save(optimizer.state_dict(), os.path.join(args.output_dir, "optimizer_%d.pt"%epoch))
+                    torch.save(scheduler.state_dict(), os.path.join(args.output_dir, "scheduler_%d.pt"%epoch))
                 early_stop.check(model_to_save, val_scores[args.early_stop_metric])  
                 if early_stop.timetobreak:
                     flag_tensor += 1
@@ -248,21 +210,8 @@ def train():
 
 def get_tokenizer_and_model(args):
     tokenizer = AutoTokenizer.from_pretrained(args.ptm_path)
-    config = AutoConfig.from_pretrained(args.ptm_path)
-    if 'bert' in args.ptm_path:
-        model_class = BertModel
-    elif 'roberta' in args.ptm_path:
-        model_class = RobertaModel
-    elif 'ulm' in args.ptm_path:
-        model_class = T5EncoderModel
-    model = ClassificationModel(config, args.pool, model_class, args.n_labels)
-    if args.model_path is None:
-        if 'ulm' in args.ptm_path:
-            backbone_model = T5EncoderModel.from_pretrained(args.ptm_path)
-        else:
-            backbone_model = AutoModel.from_pretrained(args.ptm_path)
-        model.init_pretrained_model(backbone_model.state_dict())
-    else:
+    model = AutoModelForSequenceClassification.from_pretrained(args.ptm_path, num_labels=args.n_labels)
+    if args.model_path is not None:
         model_state_dict = torch.load(args.model_path, map_location='cpu')
         model.load_state_dict(model_state_dict)
     return tokenizer, model 
@@ -270,13 +219,13 @@ def get_tokenizer_and_model(args):
 def load_datasets(args, tokenizer):
     # LOAD DATASETS
     train_data = load_jsonl(args.train_data)
-    train_dataset = ClassificationDataset(train_data, tokenizer, args.max_length)
+    train_dataset = NLIDataset(train_data, tokenizer, args.max_length) # model type
     if args.distributed:
         # OK - legacy
         val_data = load_data(args.val_data, args.local_rank, args.distributed)
     else:
         val_data = load_jsonl(args.val_data)
-    val_dataset = ClassificationDataset(val_data, tokenizer, args.max_length)
+    val_dataset = NLIDataset(val_data, tokenizer, args.max_length)
     return train_dataset, val_dataset
         
         
@@ -317,36 +266,15 @@ if __name__=='__main__':
     ########################################################################################
     train_dataset, val_dataset = load_datasets(args, tokenizer)
     
-    # binary weight
-    weights = None
-    if args.weighted_loss:
-        labels = [i['label'] for i in train_dataset]
-        weights = [1/labels.count(c) for c in range(args.n_labels)]
-        if args.n_labels == 1:
-            weights = weights.append(1/labels.count(1))
-        weights = torch.tensor(weights)
-    args.weights = weights.tolist() if weights is not None else weights
-        
     # save
     if args.local_rank in [-1,0]:
         with open(os.path.join(args.output_dir,'args.txt'), 'w') as f:
             json.dump(args.__dict__, f, indent=2)
-    args.weights = torch.tensor(args.weights)
-    # weighted_sampling & distributed
-    if args.weighted_sampling:
-        if args.distributed:
-            train_sampler = DistributedWeightedRandomSampler(train_dataset, replacement=True)
-        else:
-            n_class = Counter([i['label'] for i in train_dataset]) 
-            class_weight = {i:1/j for i,j in n_class.items()}
-            weight =  torch.DoubleTensor([class_weight[i['label']] for i in train_dataset])
-            train_sampler = WeightedRandomSampler(weight, len(train_dataset), replacement=True)
+    if args.distributed:
+        train_sampler = DistributedSampler(train_dataset) 
     else:
-        if args.distributed:
-            train_sampler = DistributedSampler(train_dataset) 
-        else:
-            train_sampler = RandomSampler(train_dataset)
-   
+        train_sampler = RandomSampler(train_dataset)
+    
     train_dataloader = DataLoader(train_dataset,batch_size = args.batch_size, sampler = train_sampler, collate_fn = train_dataset.collate_fn)
     val_sampler = SequentialSampler(val_dataset)
     val_dataloader = DataLoader(val_dataset,batch_size = args.batch_size, sampler = val_sampler, collate_fn = val_dataset.collate_fn)

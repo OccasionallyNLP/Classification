@@ -14,80 +14,54 @@ from torch.utils.data import Dataset, DataLoader, DistributedSampler, RandomSamp
 from torch.cuda.amp import autocast
 from torch.cuda.amp import GradScaler
 import numpy as np
-from transformers import AutoTokenizer, AutoModel, AutoConfig, BertModel, RobertaModel, T5EncoderModel, get_constant_schedule_with_warmup
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, get_constant_schedule_with_warmup
 import argparse
 from utils.data_utils import *
 from utils.distributed_utils import *
 from utils.utils import *
-from model import *
-from losses import *
 from sklearn.metrics import accuracy_score, f1_score
-from collections import defaultdict
 
-def calc_loss(args, logits, labels, weights=None):
-    # label에 따른 차이가 필요함.
-    if weights is not None:
-        weights = weights.to(labels)
-    if args.n_labels != 1:
-            # just for binary classification
-        if args.focal_loss:
-            loss_fn = FocalLoss(args.gamma, weights)
-        else:
-            loss_fn = nn.CrossEntropyLoss(weight=weights)
-    else:
-        if args.focal_loss:
-            loss_fn = BinaryFocalLoss(weights, args.gamma)
-        else:
-            loss_fn = torch.nn.BCEWithLogitsLoss()
-        logits = logits.squeeze(1)
-        labels = labels.float()
-    loss = loss_fn(logits, labels)
-    return loss
+from peft import (
+    get_peft_config,
+    get_peft_model,
+    get_peft_model_state_dict,
+    set_peft_model_state_dict,
+    LoraConfig,
+    PeftType,
+    PrefixTuningConfig,
+    PromptEncoderConfig,
+)
 
 # evaluation
 def evaluation(args, model, tokenizer, eval_dataloader):
     total_loss = 0.
     model.eval()
-    predicts = defaultdict(list)
-    actuals = defaultdict(list)
+    predicts = []
+    actuals = []
     with torch.no_grad():
         for data in tqdm(eval_dataloader, desc = 'evaluate', disable =  args.local_rank not in [-1,0]):
             data = {i:j.cuda() for i,j in data.items()}
             output = model.forward(**data)
-            losses = dict()
-            for k in range(len(args.n_labels)):
-                losses[k] = calc_loss(args, output['score_%d'%k], data['labels_%d'%k], weights=weights[k]) # TODO - weights를 list로
-            loss = summation(losses.values())
-            total_loss+=loss
-            # predicts가 여러개임.
-            
-            for _,k in enumerate(args.n_labels):
-                if k == 1:
-                    predict = (torch.sigmoid(output['score_%d'%k])>=0.5).squeeze(1).long().cpu().tolist()
-                else:
-                    predict = output['score_%d'%k].argmax(dim=-1).cpu().tolist()
-                actual = data['labels_%d'%k].cpu().tolist()
-                predicts[_].extend(predict)
-                actuals[_].extend(actual)
-    acc = {k:accuracy_score(actuals[k], predicts[k]) for k in range(len(args.n_labels))} 
-    f1 = {k:f1_score(actuals[k], predicts[k], average='weighted') for k in range(len(args.n_labels))} 
-    results = dict(loss=total_loss/len(eval_dataloader))
-    for a,b in acc.items():
-        results['acc_%d'%a]=b
-    for a,b in f1.items():
-        results['f1_%d'%a]=b
-    return results
+            loss = output.loss
+            total_loss+=loss.item()
+            predict = output.logits.argmax(dim=-1).cpu().tolist()
+            actual = data['labels'].cpu().tolist()
+            predicts.extend(predict)
+            actuals.extend(actual)
+    acc = accuracy_score(actuals, predicts)
+    f1 = f1_score(actuals, predicts, average='weighted')
+    return dict(loss=total_loss/len(eval_dataloader), acc=acc, f1=f1)
 
 def get_scores(local_rank, scores, distributed:bool):
-    results = {}
+    output = {}
     if distributed:
         for i,j in scores.items():
-            tmp = [j.item() for j in get_global(local_rank, torch.tensor([scores[i]]).cuda())]
-            results[i] = np.round(sum(tmp) / len(tmp),3)
+            tmp = [j.item() for j in get_global(local_rank, torch.tensor([j]).cuda())]
+            output[i] = np.round(sum(tmp)/len(tmp),4)
     else:
         for i,j in scores.items():
-            results[i] = np.round(j,3)
-    return results
+            output[i] = np.round(j,4)
+    return output
 
 def get_args():
     # parser
@@ -111,18 +85,19 @@ def get_args():
     parser.add_argument('--decay', type=float, default = 0.1)
     parser.add_argument('--accumulation_steps', type=int, default = 1) # 221124 추가
     
-    # 경량화
-    parser.add_argument('--fp16', type=str2bool, default = True)
+    # peft
+    parser.add_argument('--r', type=int, default = 8)
+    parser.add_argument('--lora_alpha', type=int, default = 16)
+    parser.add_argument('--lora_dropout', type=float, default = 0.1)
     
-    # imbalance
-    parser.add_argument('--weighted_loss', type=str2bool, default = False) # 221124 추가
-    parser.add_argument('--focal_loss', type=str2bool, default = False) # 221124 추가
-    parser.add_argument('--gamma', type=int) # 221124 추가
+    
+    # 경량화
+    parser.add_argument('--fp16', type=str2bool, default = False)
+    parser.add_argument('--fp16_model', type=str2bool, default = False)
     
     # PTM model
     parser.add_argument('--ptm_path', type=str)
     parser.add_argument('--model_path', type=str)
-    parser.add_argument('--pool', type=str, default = 'cls')
     
     # model input
     parser.add_argument('--max_length', type=int)
@@ -138,15 +113,6 @@ def get_args():
     
     args  = parser.parse_args()
     return args
-
-def summation(b):
-    a = None
-    for i in b:
-        if a is None:
-            a = i
-        else:
-            a+=i
-    return a
 
 def train():
     # optimizer
@@ -179,13 +145,24 @@ def train():
             step+=1
             optimizer.zero_grad()            
             data = {i:j.cuda() for i,j in data.items()}
-            if args.fp16:
+            if args.fp16_model or not args.fp16:
+                output = model.forward(**data)
+                loss = output.loss
+                loss = loss / args.accumulation_steps
+                loss.backward()
+                if step%args.accumulation_steps==0 or (
+                    len(train_dataloader) <= args.accumulation_steps
+                    and (step) == len(train_dataloader)
+            ):
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    global_step+=1
+            else:
                 with autocast():
                     output = model.forward(**data)
-                    losses = dict()
-                    for k in range(len(args.n_labels)):
-                        losses[k] = calc_loss(args, output['score_%d'%k], data['labels_%d'%k], weights=weights[k]) # TODO - weights를 list로
-                    loss = summation(losses.values())
+                    loss = output.loss
                     loss = loss / args.accumulation_steps
                     scaler.scale(loss).backward()
                     if step%args.accumulation_steps==0 or (
@@ -199,24 +176,7 @@ def train():
                         scheduler.step()
                         optimizer.zero_grad()
                         global_step+=1
-            else:
-                output = model.forward(**data)
-                losses = dict()
-                for k in range(len(args.n_labels)):
-                    losses[k] = calc_loss(args, output['score_%d'%k], data['labels_%d'%k], weights=weights[k]) # TODO - weights를 list로
-                loss = summation(losses.values())
-                loss = loss / args.accumulation_steps
-                loss.backward()
-                if step%args.accumulation_steps==0 or (
-                    len(train_dataloader) <= args.accumulation_steps
-                    and (step) == len(train_dataloader)
-            ):
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad()
-                    global_step+=1
-                    
+                
             if args.distributed:
                 torch.distributed.reduce(loss, 0)
                 loss = loss / torch.distributed.get_world_size()
@@ -235,24 +195,18 @@ def train():
         # evaluation
         ###################################################################################################
         if args.eval_epoch!=0 and epoch%args.eval_epoch==0:
-            # train
-            train_scores_ = evaluation(args, model, tokenizer, train_dataloader)
-            train_scores = get_scores(args.local_rank, train_scores_, args.distributed)            
-            
             # validation
             val_scores_ = evaluation(args, model, tokenizer, val_dataloader)
             val_scores = get_scores(args.local_rank, val_scores_, args.distributed)            
             
             if args.local_rank in [-1,0]:
-                logger1.info(f'Train ---- epoch : {epoch} ----- scores:{train_scores}')
-                logger2.info(f'Train ---- epoch : {epoch} ----- scores:{train_scores}')
                 logger1.info(f'Val ---- epoch : {epoch} ----- scores:{val_scores}')
                 logger2.info(f'Val ---- epoch : {epoch} ----- scores:{val_scores}')
                 model_to_save = model.module if hasattr(model,'module') else model
                 if args.save_model_every_epoch:
                     torch.save(model_to_save, os.path.join(args.output_dir,'model_%d'%epoch))
-                    # torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
-                    # torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
+                    torch.save(optimizer.state_dict(), os.path.join(args.output_dir, "optimizer_%d.pt"%epoch))
+                    torch.save(scheduler.state_dict(), os.path.join(args.output_dir, "scheduler_%d.pt"%epoch))
                 early_stop.check(model_to_save, val_scores[args.early_stop_metric])  
                 if early_stop.timetobreak:
                     flag_tensor += 1
@@ -273,36 +227,54 @@ def train():
         logger2.info('train end')
 
 def get_tokenizer_and_model(args):
-    tokenizer = AutoTokenizer.from_pretrained(args.ptm_path)
-    config = AutoConfig.from_pretrained(args.ptm_path)
-    if 'bert' in args.ptm_path:
-        model_class = BertModel
-    elif 'roberta' in args.ptm_path:
-        model_class = RobertaModel
-    elif 'ulm' in args.ptm_path:
-        model_class = T5EncoderModel
-    model = MTClassificationModel(config, args.pool, model_class, args.n_labels)
-    if args.model_path is None:
-        if 'ulm' in args.ptm_path:
-            backbone_model = T5EncoderModel.from_pretrained(args.ptm_path)
-        else:
-            backbone_model = AutoModel.from_pretrained(args.ptm_path)
-        model.init_pretrained_model(backbone_model.state_dict())
+    if any(k in args.ptm_path for k in ("gpt", "opt", "bloom", "Polyglot")):
+        padding_side = "left"
     else:
+        padding_side = "right"
+    tokenizer = AutoTokenizer.from_pretrained(args.ptm_path, padding_side=padding_side)
+    if getattr(tokenizer, "pad_token_id") is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    model = AutoModelForSequenceClassification.from_pretrained(args.ptm_path, num_labels=args.n_labels, torch_dtype="auto", low_cpu_mem_usage=True)
+    
+    # kogpt
+#     tokenizer = AutoTokenizer.from_pretrained(
+#   'kakaobrain/kogpt', revision='KoGPT6B-ryan1.5b-float16',  # or float32 version: revision=KoGPT6B-ryan1.5b
+#   bos_token='[BOS]', eos_token='[EOS]', unk_token='[UNK]', pad_token='[PAD]', mask_token='[MASK]',
+# padding_side=padding_side)
+#     model = AutoModelForSequenceClassification.from_pretrained(
+#   'kakaobrain/kogpt', revision='KoGPT6B-ryan1.5b-float16',  # or float32 version: revision=KoGPT6B-ryan1.5b
+#   pad_token_id=tokenizer.eos_token_id,
+#   torch_dtype='auto', low_cpu_mem_usage=True, num_labels=args.n_labels
+# )
+    
+    if args.model_path is not None:
         model_state_dict = torch.load(args.model_path, map_location='cpu')
         model.load_state_dict(model_state_dict)
+    
+    # peft
+    if 'bert' in args.ptm_path or 'roberta' in args.ptm_path:
+        peft_config = LoraConfig(task_type="SEQ_CLS", inference_mode=False, r=args.r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout)
+    elif 't5' in args.ptm_path:
+        pass
+    else:
+        peft_config = LoraConfig(task_type="CAUSAL_LM", inference_mode=False, r=args.r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout)
+        
+    model = get_peft_model(model, peft_config)
+    print('model trainable parameters')
+    model.print_trainable_parameters()
     return tokenizer, model 
+
 
 def load_datasets(args, tokenizer):
     # LOAD DATASETS
     train_data = load_jsonl(args.train_data)
-    train_dataset = MTClassificationDataset(train_data, tokenizer, args.max_length, args.n_labels)
+    train_dataset = NLIDataset(train_data, tokenizer, args.max_length) # model type
     if args.distributed:
         # OK - legacy
         val_data = load_data(args.val_data, args.local_rank, args.distributed)
     else:
         val_data = load_jsonl(args.val_data)
-    val_dataset = MTClassificationDataset(val_data, tokenizer, args.max_length, args.n_labels)
+    val_dataset = NLIDataset(val_data, tokenizer, args.max_length)
     return train_dataset, val_dataset
         
         
@@ -319,6 +291,7 @@ if __name__=='__main__':
     ########################################################################################
     # tokenizer, model load
     ########################################################################################
+    #peft_config = get_peft_config(args)
     tokenizer, model = get_tokenizer_and_model(args)
     ########################################################################################
     
@@ -343,19 +316,6 @@ if __name__=='__main__':
     ########################################################################################
     train_dataset, val_dataset = load_datasets(args, tokenizer)
     
-    # binary weight
-    # TODO
-    weights = dict()
-    if args.weighted_loss:
-        for k in range(len(args.n_labels)):
-            weight = None
-            labels = [i['label_%d'%k] for i in train_dataset]
-            weight = [1/labels.count(c) for c in range(args.n_labels[k])]
-            if args.n_labels[k] == 1:
-                weight = weight.append(1/labels.count(1))
-            weight = torch.tensor(weight)
-            weights[k]= weight 
-    args.weights = {i:j.tolist() if j is not None else j for i,j in weights.items()}
     # save
     if args.local_rank in [-1,0]:
         with open(os.path.join(args.output_dir,'args.txt'), 'w') as f:
@@ -364,7 +324,7 @@ if __name__=='__main__':
         train_sampler = DistributedSampler(train_dataset) 
     else:
         train_sampler = RandomSampler(train_dataset)
-   
+    
     train_dataloader = DataLoader(train_dataset,batch_size = args.batch_size, sampler = train_sampler, collate_fn = train_dataset.collate_fn)
     val_sampler = SequentialSampler(val_dataset)
     val_dataloader = DataLoader(val_dataset,batch_size = args.batch_size, sampler = val_sampler, collate_fn = val_dataset.collate_fn)
