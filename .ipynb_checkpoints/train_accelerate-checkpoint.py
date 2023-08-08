@@ -11,8 +11,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, DistributedSampler, RandomSampler, SequentialSampler
-from torch.cuda.amp import autocast
-from torch.cuda.amp import GradScaler
+
+from accelerate import Accelerator
+
 import numpy as np
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, get_constant_schedule_with_warmup
 import argparse
@@ -20,17 +21,6 @@ from utils.data_utils import *
 from utils.distributed_utils import *
 from utils.utils import *
 from sklearn.metrics import accuracy_score, f1_score
-
-from peft import (
-    get_peft_config,
-    get_peft_model,
-    get_peft_model_state_dict,
-    set_peft_model_state_dict,
-    LoraConfig,
-    PeftType,
-    PrefixTuningConfig,
-    PromptEncoderConfig,
-)
 
 # evaluation
 def evaluation(args, model, tokenizer, eval_dataloader):
@@ -85,15 +75,8 @@ def get_args():
     parser.add_argument('--decay', type=float, default = 0.1)
     parser.add_argument('--accumulation_steps', type=int, default = 1) # 221124 추가
     
-    # peft
-    parser.add_argument('--r', type=int, default = 8)
-    parser.add_argument('--lora_alpha', type=int, default = 16)
-    parser.add_argument('--lora_dropout', type=float, default = 0.1)
-    
-    
     # 경량화
-    parser.add_argument('--fp16', type=str2bool, default = False)
-    parser.add_argument('--fp16_model', type=str2bool, default = False)
+    parser.add_argument('--fp16', type=str2bool, default = True)
     
     # PTM model
     parser.add_argument('--ptm_path', type=str)
@@ -115,13 +98,6 @@ def get_args():
     return args
 
 def train():
-    # optimizer
-    optimizer_grouped_parameters = make_optimizer_group(model, args.decay)
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.lr, weight_decay=args.decay)
-    # scheduler
-    t_total = len(train_dataloader)*args.epochs//args.accumulation_steps
-    n_warmup = int(t_total*args.warmup) if args.warmup<1 else int(args.warmup)
-    scheduler = get_constant_schedule_with_warmup(optimizer, num_warmup_steps=n_warmup)
     if args.local_rank in [-1,0]:
         early_stop = EarlyStopping(args.patience, args.output_dir, max = args.early_stop_metric_is_max_better, min_difference=1e-5)
     if args.fp16:
@@ -131,7 +107,7 @@ def train():
     # train
     ########################################################################################
     global_step = 0
-    optimizer.zero_grad()      
+    optimizer.zero_grad() # XXX 23.08.08
     for epoch in range(1, args.epochs+1):
         if args.distributed:
             train_sampler.set_epoch(epoch)
@@ -142,39 +118,20 @@ def train():
         #train
         for data in iter_bar:
             step+=1
-            data = {i:j.cuda() for i,j in data.items()}
-            if args.fp16_model or not args.fp16:
-                output = model.forward(**data)
-                loss = output.loss
-                loss = loss / args.accumulation_steps
-                loss.backward()
-                if step%args.accumulation_steps==0 or (
-                    len(train_dataloader) <= args.accumulation_steps
-                    and (step) == len(train_dataloader)
-            ):
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad()
-                    global_step+=1
-            else:
-                with autocast():
-                    output = model.forward(**data)
-                    loss = output.loss
-                    loss = loss / args.accumulation_steps
-                    scaler.scale(loss).backward()
-                    if step%args.accumulation_steps==0 or (
-                    len(train_dataloader) <= args.accumulation_steps
-                    and (step) == len(train_dataloader)
-            ):
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
-                        scaler.step(optimizer)
-                        scaler.update()
-                        scheduler.step()
-                        optimizer.zero_grad()
-                        global_step+=1
-                
+            output = model.forward(**data)
+            loss = output.loss
+            loss = loss / args.accumulation_steps
+            accelerator.backward(loss)
+            if step%args.accumulation_steps==0 or (
+                len(train_dataloader) <= args.accumulation_steps
+                and (step) == len(train_dataloader)
+        ):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                global_step+=1
+                    
             if args.distributed:
                 torch.distributed.reduce(loss, 0)
                 loss = loss / torch.distributed.get_world_size()
@@ -225,43 +182,12 @@ def train():
         logger2.info('train end')
 
 def get_tokenizer_and_model(args):
-    if any(k in args.ptm_path for k in ("gpt", "opt", "bloom", "Polyglot")):
-        padding_side = "left"
-    else:
-        padding_side = "right"
-    tokenizer = AutoTokenizer.from_pretrained(args.ptm_path, padding_side=padding_side)
-    if getattr(tokenizer, "pad_token_id") is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-    model = AutoModelForSequenceClassification.from_pretrained(args.ptm_path, num_labels=args.n_labels, torch_dtype="auto", low_cpu_mem_usage=True)
-    
-    # kogpt
-#     tokenizer = AutoTokenizer.from_pretrained(
-#   'kakaobrain/kogpt', revision='KoGPT6B-ryan1.5b-float16',  # or float32 version: revision=KoGPT6B-ryan1.5b
-#   bos_token='[BOS]', eos_token='[EOS]', unk_token='[UNK]', pad_token='[PAD]', mask_token='[MASK]',
-# padding_side=padding_side)
-#     model = AutoModelForSequenceClassification.from_pretrained(
-#   'kakaobrain/kogpt', revision='KoGPT6B-ryan1.5b-float16',  # or float32 version: revision=KoGPT6B-ryan1.5b
-#   pad_token_id=tokenizer.eos_token_id,
-#   torch_dtype='auto', low_cpu_mem_usage=True, num_labels=args.n_labels
-# )
-    
+    tokenizer = AutoTokenizer.from_pretrained(args.ptm_path)
+    model = AutoModelForSequenceClassification.from_pretrained(args.ptm_path, num_labels=args.n_labels)
     if args.model_path is not None:
         model_state_dict = torch.load(args.model_path, map_location='cpu')
         model.load_state_dict(model_state_dict)
-    
-    # peft
-    if 'bert' in args.ptm_path or 'roberta' in args.ptm_path:
-        peft_config = LoraConfig(task_type="SEQ_CLS", inference_mode=False, r=args.r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout)
-    elif 't5' in args.ptm_path:
-        pass
-    else:
-        peft_config = LoraConfig(task_type="CAUSAL_LM", inference_mode=False, r=args.r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout)
-        
-    model = get_peft_model(model, peft_config)
-    print('model trainable parameters')
-    model.print_trainable_parameters()
     return tokenizer, model 
-
 
 def load_datasets(args, tokenizer):
     # LOAD DATASETS
@@ -274,7 +200,16 @@ def load_datasets(args, tokenizer):
         val_data = load_jsonl(args.val_data)
     val_dataset = NLIDataset(val_data, tokenizer, args.max_length)
     return train_dataset, val_dataset
-        
+
+def get_optimizer_scheduler(args, model, train_dataloader):
+    # optimizer
+    optimizer_grouped_parameters = make_optimizer_group(model, args.decay)
+    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.lr, weight_decay=args.decay)
+    # scheduler
+    t_total = len(train_dataloader)*args.epochs//args.accumulation_steps
+    n_warmup = int(t_total*args.warmup) if args.warmup<1 else int(args.warmup)
+    scheduler = get_constant_schedule_with_warmup(optimizer, num_warmup_steps=n_warmup)
+    return optimizer, scheduler
         
 if __name__=='__main__':
     args  = get_args()
@@ -289,24 +224,15 @@ if __name__=='__main__':
     ########################################################################################
     # tokenizer, model load
     ########################################################################################
-    #peft_config = get_peft_config(args)
     tokenizer, model = get_tokenizer_and_model(args)
     ########################################################################################
     
     ########################################################################################
-    # distributed 관련
+    # device 관련
     ########################################################################################
-    if args.distributed:
-        assert torch.cuda.is_available()
-        assert torch.cuda.device_count()>1
-        # 이 프로세스가 어느 gpu에 할당되는지 명시
-        torch.cuda.set_device(args.local_rank)
-        # 통신을 위한 초기화
-        torch.distributed.init_process_group(backend='nccl', init_method='env://')
-        model.cuda()
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank],output_device = args.local_rank)
-    else:
-        model.cuda()
+    accelerator = Accelerator()
+    device = accelerator.device
+    model.to(device)
     ########################################################################################
     
     ########################################################################################
@@ -326,7 +252,12 @@ if __name__=='__main__':
     train_dataloader = DataLoader(train_dataset,batch_size = args.batch_size, sampler = train_sampler, collate_fn = train_dataset.collate_fn)
     val_sampler = SequentialSampler(val_dataset)
     val_dataloader = DataLoader(val_dataset,batch_size = args.batch_size, sampler = val_sampler, collate_fn = val_dataset.collate_fn)
-    ########################################################################################
+    # optimizer, scheduler
+    optimizer, scheduler = get_optimizer_scheduler(args, model, train_dataloader)      ########################################################################################
+    
+    # prepare
+    model, optimizer, train_dataloader, scheduler = accelerator.prepare(
+    model, optimizer, train_dataloader, scheduler)
     
     ########################################################################################
     # train

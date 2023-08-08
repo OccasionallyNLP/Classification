@@ -131,8 +131,7 @@ def train():
     # train
     ########################################################################################
     global_step = 0
-    train_plot = []
-    val_plot = []
+    optimizer.zero_grad()      
     for epoch in range(1, args.epochs+1):
         if args.distributed:
             train_sampler.set_epoch(epoch)
@@ -143,7 +142,6 @@ def train():
         #train
         for data in iter_bar:
             step+=1
-            optimizer.zero_grad()            
             data = {i:j.cuda() for i,j in data.items()}
             if args.fp16_model or not args.fp16:
                 output = model.forward(**data)

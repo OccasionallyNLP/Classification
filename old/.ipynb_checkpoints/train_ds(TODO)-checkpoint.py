@@ -19,7 +19,10 @@ import argparse
 from utils.data_utils import *
 from utils.distributed_utils import *
 from utils.utils import *
-from sklearn.metrics import accuracy_score, f1_score
+from utils.metrics import *
+from model import *
+import deepspeed 
+from transformers.deepspeed import HfDeepSpeedConfig
 
 from peft import (
     get_peft_config,
@@ -71,30 +74,25 @@ def get_args():
     # data
     parser.add_argument('--train_data', type=str, help = 'train_data 위치')
     parser.add_argument('--val_data', type=str, help='val data 위치')
-    parser.add_argument('--n_labels', type=int)
     
     # logging 관련
     parser.add_argument('--logging_term', type=int, default = 100)
    
     # 학습 관련
-    parser.add_argument('--epochs', type=int, default = 20)
+    parser.add_argument('--epochs', default = 10, type=int)
     parser.add_argument('--eval_epoch', type = int, default = 1, help = 'term of evaluation')
     parser.add_argument('--batch_size', default = 8, type=int)
     parser.add_argument('--lr', type=float, default = 5e-5)
-    parser.add_argument('--warmup', type=float, default = 0.05)
-    parser.add_argument('--decay', type=float, default = 0.1)
-    parser.add_argument('--accumulation_steps', type=int, default = 1) # 221124 추가
-    
-    # peft
-    parser.add_argument('--r', type=int, default = 8)
-    parser.add_argument('--lora_alpha', type=int, default = 16)
-    parser.add_argument('--lora_dropout', type=float, default = 0.1)
-    
+    parser.add_argument('--warmup', type=float, default = 1000)
+    parser.add_argument('--decay', type=float, default = 0.05)
     
     # 경량화
     parser.add_argument('--fp16', type=str2bool, default = False)
     parser.add_argument('--fp16_model', type=str2bool, default = False)
     
+    
+    parser.add_argument('--accumulation_steps', type=int, default = 1) # 221124 추가
+    parser.add_argument('--weighted_sampling', type=str2bool, default = False) # 221124 추가
     # PTM model
     parser.add_argument('--ptm_path', type=str)
     parser.add_argument('--model_path', type=str)
@@ -106,80 +104,76 @@ def get_args():
     parser.add_argument('--local_rank', type=int, default = -1)
     parser.add_argument('--distributed', type=str2bool, default = False)
     parser.add_argument('--early_stop', type=str2bool, default = True) # XXX220919
-    parser.add_argument('--early_stop_metric', type=str, default = 'loss') # 230619 추가
-    parser.add_argument('--early_stop_metric_is_max_better', type=str2bool, default = False) # 230619 추가
     parser.add_argument('--patience', type=int, default = 3)
-    parser.add_argument('--save_model_every_epoch', type=str2bool, default = False) # 230619 추가
     
-    args  = parser.parse_args()
+    # deepspeed
+    # deepspeed
+    parser = deepspeed.add_config_arguments(parser)
+    args = parser.parse_args()
     return args
 
+def synchronize_config_with_deepspeed(args, dataset):
+    ds_config = json.load(open(args.deepspeed_config,'r',encoding='utf-8'))
+    # batch size
+    args.batch_size = ds_config['train_micro_batch_size_per_gpu']
+    total_step = int(len(dataset)/args.batch_size)
+    warmup = total_step * args.warmup
+    ds_config['scheduler']['params']['warmup_num_steps']=warmup
+    args.fp16 = ds_config['fp16']['enabled']
+    args.logging_term = ds_config['steps_per_print']
+    return ds_config
+
+def update_lr(args, global_step, optimizer, scheduler_fn):
+    lr_this_step = args.lr * scheduler_fn(global_step)
+    for param_group in optimizer.param_groups:
+        param_group['lr']=lr_this_step
+    return lr_this_step
+
 def train():
-    # optimizer
-    optimizer_grouped_parameters = make_optimizer_group(model, args.decay)
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.lr, weight_decay=args.decay)
-    # scheduler
-    t_total = len(train_dataloader)*args.epochs//args.accumulation_steps
-    n_warmup = int(t_total*args.warmup) if args.warmup<1 else int(args.warmup)
-    scheduler = get_constant_schedule_with_warmup(optimizer, num_warmup_steps=n_warmup)
     if args.local_rank in [-1,0]:
-        early_stop = EarlyStopping(args.patience, args.output_dir, max = args.early_stop_metric_is_max_better, min_difference=1e-5)
-    if args.fp16:
-        scaler = GradScaler()
+        early_stop = EarlyStopping(args.patience, args.output_dir, max = False, min_difference=1e-5)
     flag_tensor = torch.zeros(1).cuda()
+    scheduler_fn = lambda step : min(1/model.lr_scheduler.warmup_num_steps*step, 1.)
     ########################################################################################
     # train
     ########################################################################################
+    last_lr = 0
     global_step = 0
-    optimizer.zero_grad()      
     for epoch in range(1, args.epochs+1):
         if args.distributed:
             train_sampler.set_epoch(epoch)
         model.train()
-        epoch_loss = 0.
+        Loss = 0.
         step = 0
         iter_bar = tqdm(train_dataloader, desc='step', disable=args.local_rank not in [-1,0])
         #train
         for data in iter_bar:
-            step+=1
+            optimizer.zero_grad()            
             data = {i:j.cuda() for i,j in data.items()}
-            if args.fp16_model or not args.fp16:
-                output = model.forward(**data)
-                loss = output.loss
-                loss = loss / args.accumulation_steps
-                loss.backward()
-                if step%args.accumulation_steps==0 or (
-                    len(train_dataloader) <= args.accumulation_steps
-                    and (step) == len(train_dataloader)
-            ):
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad()
-                    global_step+=1
-            else:
-                with autocast():
-                    output = model.forward(**data)
-                    loss = output.loss
-                    loss = loss / args.accumulation_steps
-                    scaler.scale(loss).backward()
-                    if step%args.accumulation_steps==0 or (
-                    len(train_dataloader) <= args.accumulation_steps
-                    and (step) == len(train_dataloader)
-            ):
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
-                        scaler.step(optimizer)
-                        scaler.update()
-                        scheduler.step()
-                        optimizer.zero_grad()
-                        global_step+=1
-                
+            loss = model.forward(**data)['loss']
+            
             if args.distributed:
-                torch.distributed.reduce(loss, 0)
-                loss = loss / torch.distributed.get_world_size()
-            epoch_loss+=loss.item()*args.accumulation_steps
-            iter_bar.set_postfix({'epoch':epoch, 'global_step':global_step, 'step':step, 'lr':f"{scheduler.get_last_lr()[0]:.5f}",'epoch_loss':f'{epoch_loss/step:.5f}'}) 
+                loss = loss.mean()
+            
+            if args.accumulation_steps > 1 :
+                loss = loss / args.accumulation_steps
+            
+            # backward loss
+            model.backward(loss)
+            
+            if step%args.accumulation_steps==0 or (
+                    len(train_dataloader) <= args.accumulation_steps
+                    and (step) == len(train_dataloader)
+            ):
+                model.step()
+                if args.fp16:
+                    last_lr = update_lr(args, global_step, optimizer, scheduler_fn)
+                else:
+                    last_lr = model.lr_scheduler.get_last_lr()[0]
+            Loss+=loss.item()
+            step+=1
+            global_step+=1
+            iter_bar.set_postfix({'epoch':epoch, 'global_step':global_step, 'lr':f"{last_lr:.5f}",'total_loss':f'{Loss/step:.5f}'}) # 감소한다는 것을 확인하는 것임.
             if global_step%args.logging_term == 0:
                 if args.local_rank in [-1,0]:
                     logger1.info(iter_bar)
@@ -194,18 +188,14 @@ def train():
         ###################################################################################################
         if args.eval_epoch!=0 and epoch%args.eval_epoch==0:
             # validation
-            val_scores_ = evaluation(args, model, tokenizer, val_dataloader)
+            val_scores_, _ = evaluation(args, model, tokenizer, val_dataloader)
             val_scores = get_scores(args.local_rank, val_scores_, args.distributed)            
             
             if args.local_rank in [-1,0]:
                 logger1.info(f'Val ---- epoch : {epoch} ----- scores:{val_scores}')
                 logger2.info(f'Val ---- epoch : {epoch} ----- scores:{val_scores}')
                 model_to_save = model.module if hasattr(model,'module') else model
-                if args.save_model_every_epoch:
-                    torch.save(model_to_save, os.path.join(args.output_dir,'model_%d'%epoch))
-                    torch.save(optimizer.state_dict(), os.path.join(args.output_dir, "optimizer_%d.pt"%epoch))
-                    torch.save(scheduler.state_dict(), os.path.join(args.output_dir, "scheduler_%d.pt"%epoch))
-                early_stop.check(model_to_save, val_scores[args.early_stop_metric])  
+                early_stop.check(model_to_save, val_scores['Loss'])  
                 if early_stop.timetobreak:
                     flag_tensor += 1
             if args.distributed:
@@ -262,7 +252,6 @@ def get_tokenizer_and_model(args):
     model.print_trainable_parameters()
     return tokenizer, model 
 
-
 def load_datasets(args, tokenizer):
     # LOAD DATASETS
     train_data = load_jsonl(args.train_data)
@@ -280,49 +269,38 @@ if __name__=='__main__':
     args  = get_args()
     seed_everything(42)
     os.makedirs(args.output_dir, exist_ok = True)
-    
+    if args.local_rank in [-1,0]:
+        with open(os.path.join(args.output_dir,'args.txt'), 'w') as f:
+            json.dump(args.__dict__, f, indent=2)
     logger1, logger2 = get_log(args)
     if args.local_rank in [-1,0]:
         logger1.info(args)
         logger2.info(args)
         
-    ########################################################################################
+    deepspeed.init_distributed(dist_backend='nccl') ########################################################################################
     # tokenizer, model load
     ########################################################################################
-    #peft_config = get_peft_config(args)
     tokenizer, model = get_tokenizer_and_model(args)
-    ########################################################################################
-    
-    ########################################################################################
-    # distributed 관련
-    ########################################################################################
-    if args.distributed:
-        assert torch.cuda.is_available()
-        assert torch.cuda.device_count()>1
-        # 이 프로세스가 어느 gpu에 할당되는지 명시
-        torch.cuda.set_device(args.local_rank)
-        # 통신을 위한 초기화
-        torch.distributed.init_process_group(backend='nccl', init_method='env://')
-        model.cuda()
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank],output_device = args.local_rank)
-    else:
-        model.cuda()
     ########################################################################################
     
     ########################################################################################
     # data
     ########################################################################################
     train_dataset, val_dataset = load_datasets(args, tokenizer)
+    ds_config = synchronize_config_with_deepspeed(args, train_dataset)
+    dschf = HfDeepSpeedConfig(ds_config)
+    optimizer_group = make_optimizer_group(model, args.decay)
+    print(args)
+    model, optimizer, _, _ = deepspeed.initialize(args=args, model=model, model_parameters = optimizer_group, config = ds_config) # model, optimizer, train-data, lr_scheuler
+    torch.cuda.set_device(args.local_rank)
+    model.cuda()
+    ########################################################################################
     
-    # save
-    if args.local_rank in [-1,0]:
-        with open(os.path.join(args.output_dir,'args.txt'), 'w') as f:
-            json.dump(args.__dict__, f, indent=2)
+    # weighted_sampling & distributed
     if args.distributed:
         train_sampler = DistributedSampler(train_dataset) 
     else:
         train_sampler = RandomSampler(train_dataset)
-    
     train_dataloader = DataLoader(train_dataset,batch_size = args.batch_size, sampler = train_sampler, collate_fn = train_dataset.collate_fn)
     val_sampler = SequentialSampler(val_dataset)
     val_dataloader = DataLoader(val_dataset,batch_size = args.batch_size, sampler = val_sampler, collate_fn = val_dataset.collate_fn)
