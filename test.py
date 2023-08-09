@@ -19,7 +19,6 @@ from utils.data_utils import *
 from utils.distributed_utils import *
 from utils.utils import *
 from model import *
-from losses import *
 from sklearn.metrics import accuracy_score, f1_score
 
 from losses import *

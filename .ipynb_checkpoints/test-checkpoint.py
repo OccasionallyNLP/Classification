@@ -19,7 +19,6 @@ from utils.data_utils import *
 from utils.distributed_utils import *
 from utils.utils import *
 from model import *
-from losses import *
 from sklearn.metrics import accuracy_score, f1_score
 
 from losses import *
@@ -56,7 +55,11 @@ def evaluation(args, model, tokenizer, eval_dataloader):
         for data in tqdm(eval_dataloader, desc = 'evaluate', disable =  args.local_rank not in [-1,0]):
             data = {i:j.cuda() for i,j in data.items()}
             output = model.forward(**data)
+<<<<<<< HEAD
             loss = calc_loss(args, output['score'], data['labels'], weights=args.weights)
+=======
+            loss = calc_loss(args, output['score'], data['labels'], weights=weights)
+>>>>>>> ad30057295cd69f9a1138f6c8b7f6f52753d3a32
             total_loss+=loss.item()
             if args.n_labels == 1:
                 predict = (torch.sigmoid(output['score'])>=0.5).squeeze(1).long().cpu().tolist()

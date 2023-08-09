@@ -116,7 +116,7 @@ def make_2d_to_1d(data:List[List[dict]])->List:
 
 # early stop
 class EarlyStopping(object):
-    def __init__(self, patience, save_dir, max = True, min_difference=1e-5):
+    def __init__(self, patience, save_dir, max = True, min_difference=1e-5, model_save_dict=False):
         self.patience = patience
         self.min_difference = min_difference
         self.max = max
@@ -125,25 +125,30 @@ class EarlyStopping(object):
         self.best_count = 0
         self.timetobreak = False
         self.save_dir = save_dir
+        self.model_save_dict = model_save_dict
     
     def check(self, model, calc_score):
         if self.max:
             if self.score-calc_score<self.min_difference:
                 self.score = calc_score
                 self.best_count = 0
-                self.best_model = copy.deepcopy(model.state_dict())
+                if self.model_save_dict:
+                    self.best_model = copy.deepcopy(model.state_dict())
+                else:
+                    self.best_model = copy.deepcopy(model)
             else:
                 self.best_count+=1
                 if self.best_count>=self.patience:
                     self.timetobreak=True
-                    torch.save(self.best_model, os.path.join(self.save_dir,'best_model'))
         else:
             if self.score-calc_score>self.min_difference:
                 self.score = calc_score
                 self.best_count = 0
-                self.best_model = copy.deepcopy(model.state_dict())
+                if self.model_save_dict:
+                    self.best_model = copy.deepcopy(model.state_dict())
+                else:
+                    self.best_model = copy.deepcopy(model)
             else:
                 self.best_count+=1
                 if self.best_count>=self.patience:
                     self.timetobreak=True
-                    torch.save(self.best_model, os.path.join(self.save_dir,'best_model'))

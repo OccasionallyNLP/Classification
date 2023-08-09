@@ -19,7 +19,7 @@ import argparse
 from utils.data_utils import *
 from utils.distributed_utils import *
 from utils.utils import *
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, f1_score, mean_squared_error
 
 # evaluation
 def evaluation(args, model, tokenizer, eval_dataloader):
@@ -33,13 +33,18 @@ def evaluation(args, model, tokenizer, eval_dataloader):
             output = model.forward(**data)
             loss = output.loss
             total_loss+=loss.item()
-            predict = output.logits.argmax(dim=-1).cpu().tolist()
+            if args.n_labels == 1:
+                predict = output.logits.squeeze(dim=-1).cpu().tolist()
+            else:
+                predict = output.logits.argmax(dim=-1).cpu().tolist()
             actual = data['labels'].cpu().tolist()
             predicts.extend(predict)
             actuals.extend(actual)
-    acc = accuracy_score(actuals, predicts)
-    f1 = f1_score(actuals, predicts, average='weighted')
-    return dict(loss=total_loss/len(eval_dataloader), acc=acc, f1=f1)
+    if args.n_labels == 1:
+        acc = mean_squared_error(actuals, predicts)
+    else:
+        acc = accuracy_score(actuals, predicts)
+    return dict(loss=total_loss/len(eval_dataloader), acc=acc)
 
 def get_scores(local_rank, scores, distributed:bool):
     output = {}
@@ -105,7 +110,7 @@ def train():
     n_warmup = int(t_total*args.warmup) if args.warmup<1 else int(args.warmup)
     scheduler = get_constant_schedule_with_warmup(optimizer, num_warmup_steps=n_warmup)
     if args.local_rank in [-1,0]:
-        early_stop = EarlyStopping(args.patience, args.output_dir, max = args.early_stop_metric_is_max_better, min_difference=1e-5)
+        early_stop = EarlyStopping(args.patience, args.output_dir, max = args.early_stop_metric_is_max_better, min_difference=1e-5, True)
     if args.fp16:
         scaler = GradScaler()
     flag_tensor = torch.zeros(1).cuda()
@@ -113,8 +118,7 @@ def train():
     # train
     ########################################################################################
     global_step = 0
-    train_plot = []
-    val_plot = []
+    optimizer.zero_grad()            
     for epoch in range(1, args.epochs+1):
         if args.distributed:
             train_sampler.set_epoch(epoch)
@@ -125,7 +129,6 @@ def train():
         #train
         for data in iter_bar:
             step+=1
-            optimizer.zero_grad()            
             data = {i:j.cuda() for i,j in data.items()}
             if args.fp16:
                 with autocast():
@@ -186,7 +189,7 @@ def train():
                 logger2.info(f'Val ---- epoch : {epoch} ----- scores:{val_scores}')
                 model_to_save = model.module if hasattr(model,'module') else model
                 if args.save_model_every_epoch:
-                    torch.save(model_to_save, os.path.join(args.output_dir,'model_%d'%epoch))
+                    torch.save(model_to_save.state_dict(), os.path.join(args.output_dir,'model_%d'%epoch))
                     torch.save(optimizer.state_dict(), os.path.join(args.output_dir, "optimizer_%d.pt"%epoch))
                     torch.save(scheduler.state_dict(), os.path.join(args.output_dir, "scheduler_%d.pt"%epoch))
                 early_stop.check(model_to_save, val_scores[args.early_stop_metric])  
@@ -195,7 +198,7 @@ def train():
             if args.distributed:
                 torch.distributed.broadcast(flag_tensor, 0) 
                 torch.distributed.barrier()
-        ###################################################################################################
+        #############################################################################r######################
         if args.early_stop:    
             if flag_tensor:
                 if args.local_rank in [-1,0]:

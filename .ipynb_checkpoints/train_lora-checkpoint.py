@@ -202,9 +202,11 @@ def train():
                 logger2.info(f'Val ---- epoch : {epoch} ----- scores:{val_scores}')
                 model_to_save = model.module if hasattr(model,'module') else model
                 if args.save_model_every_epoch:
-                    torch.save(model_to_save, os.path.join(args.output_dir,'model_%d'%epoch))
-                    torch.save(optimizer.state_dict(), os.path.join(args.output_dir, "optimizer_%d.pt"%epoch))
-                    torch.save(scheduler.state_dict(), os.path.join(args.output_dir, "scheduler_%d.pt"%epoch))
+                    cur_path = os.path.join(args.output_dir,'model_%d'%epoch)
+                    os.makedirs(cur_path, exist_ok = True)
+                    model_to_save.save_pretrained(cur_path)
+                    torch.save(optimizer.state_dict(), os.path.join(cur_path, "optimizer_%d.pt"%epoch))
+                    torch.save(scheduler.state_dict(), os.path.join(cur_path, "scheduler_%d.pt"%epoch))
                 early_stop.check(model_to_save, val_scores[args.early_stop_metric])  
                 if early_stop.timetobreak:
                     flag_tensor += 1
@@ -220,7 +222,9 @@ def train():
                 break
     # 저장시 - gpu 0번 것만 저장 - barrier 필수
     if args.local_rank in [-1,0]:
-        torch.save(early_stop.best_model, os.path.join(early_stop.save_dir,'best_model'))
+        cur_path = os.path.join(args.output_dir,'best_model')
+        os.makedirs(cur_path, exist_ok = True)
+        model_to_save.save_pretrained(cur_path)
         logger1.info('train_end')
         logger2.info('train end')
 

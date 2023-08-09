@@ -10,10 +10,8 @@ import re
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, DistributedSampler, RandomSampler, SequentialSampler
-
+from torch.utils.data import Dataset, DataLoader
 from accelerate import Accelerator
-
 import numpy as np
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, get_constant_schedule_with_warmup
 import argparse
@@ -75,7 +73,9 @@ def get_args():
     parser.add_argument('--decay', type=float, default = 0.1)
     parser.add_argument('--accumulation_steps', type=int, default = 1) # 221124 추가
     
+    
     # 경량화
+    parser.add_argument('--cpu', type=str2bool, default = False)
     parser.add_argument('--fp16', type=str2bool, default = True)
     
     # PTM model
@@ -109,17 +109,16 @@ def train():
     global_step = 0
     optimizer.zero_grad() # XXX 23.08.08
     for epoch in range(1, args.epochs+1):
-        if args.distributed:
-            train_sampler.set_epoch(epoch)
         model.train()
         epoch_loss = 0.
-        sggtep = 0
+        step = 0
         iter_bar = tqdm(train_dataloader, desc='step', disable=args.local_rank not in [-1,0])
         #train
         for data in iter_bar:
             step+=1
             output = model.forward(**data)
             loss = output.loss
+            loss = loss.mean()
             loss = loss / args.accumulation_steps
             accelerator.backward(loss)
             if step%args.accumulation_steps==0 or (
@@ -132,9 +131,6 @@ def train():
                 optimizer.zero_grad()
                 global_step+=1
                     
-            if args.distributed:
-                torch.distributed.reduce(loss, 0)
-                loss = loss / torch.distributed.get_world_size()
             epoch_loss+=loss.item()*args.accumulation_steps
             iter_bar.set_postfix({'epoch':epoch, 'global_step':global_step, 'step':step, 'lr':f"{scheduler.get_last_lr()[0]:.5f}",'epoch_loss':f'{epoch_loss/step:.5f}'}) 
             if global_step%args.logging_term == 0:
@@ -230,7 +226,7 @@ if __name__=='__main__':
     ########################################################################################
     # device 관련
     ########################################################################################
-    accelerator = Accelerator()
+    accelerator = Accelerator(cpu=args.cpu, mixed_precision=args.fp16) # TODO
     device = accelerator.device
     model.to(device)
     ########################################################################################
@@ -239,26 +235,22 @@ if __name__=='__main__':
     # data
     ########################################################################################
     train_dataset, val_dataset = load_datasets(args, tokenizer)
-    
     # save
     if args.local_rank in [-1,0]:
         with open(os.path.join(args.output_dir,'args.txt'), 'w') as f:
             json.dump(args.__dict__, f, indent=2)
-    if args.distributed:
-        train_sampler = DistributedSampler(train_dataset) 
-    else:
-        train_sampler = RandomSampler(train_dataset)
+    train_dataloader = DataLoader(train_dataset,batch_size = args.batch_size, collate_fn = train_dataset.collate_fn)
+    val_dataloader = DataLoader(val_dataset,batch_size = args.batch_size, collate_fn = val_dataset.collate_fn)
+    ########################################################################################
     
-    train_dataloader = DataLoader(train_dataset,batch_size = args.batch_size, sampler = train_sampler, collate_fn = train_dataset.collate_fn)
-    val_sampler = SequentialSampler(val_dataset)
-    val_dataloader = DataLoader(val_dataset,batch_size = args.batch_size, sampler = val_sampler, collate_fn = val_dataset.collate_fn)
-    # optimizer, scheduler
-    optimizer, scheduler = get_optimizer_scheduler(args, model, train_dataloader)      ########################################################################################
-    
+    ########################################################################################
+    # optimizer, scheduler 관련
+    ########################################################################################
+    optimizer, scheduler = get_optimizer_scheduler(args, model, train_dataloader)           
+    #######################################################################################
     # prepare
     model, optimizer, train_dataloader, scheduler = accelerator.prepare(
     model, optimizer, train_dataloader, scheduler)
-    
     ########################################################################################
     # train
     ########################################################################################
