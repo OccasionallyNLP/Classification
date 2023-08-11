@@ -14,7 +14,7 @@ from torch.utils.data import Dataset, DataLoader, DistributedSampler, RandomSamp
 from torch.cuda.amp import autocast
 from torch.cuda.amp import GradScaler
 import numpy as np
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, get_constant_schedule_with_warmup
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, get_constant_schedule_with_warmup, AutoModelForSeq2SeqLM
 import argparse
 from utils.data_utils import *
 from utils.distributed_utils import *
@@ -40,12 +40,32 @@ def evaluation(args, model, tokenizer, eval_dataloader):
     actuals = []
     with torch.no_grad():
         for data in tqdm(eval_dataloader, desc = 'evaluate', disable =  args.local_rank not in [-1,0]):
-            data = {i:j.cuda() for i,j in data.items()}
+            data = {i:j.cuda() for i,j in data.items() if i!='token_type_ids'} 
+            if 't5' in args.ptm_path:
+                labels = copy.deepcopy(data['labels'])
+                data['labels'][data['labels']==tokenizer.pad_token_id]=-100 # 굉장히 중요.
             output = model.forward(**data)
             loss = output.loss
             total_loss+=loss.item()
-            predict = output.logits.argmax(dim=-1).cpu().tolist()
-            actual = data['labels'].cpu().tolist()
+            if 't5' in args.ptm_path:
+                model_to_generate = model.module if hasattr(model,'module') else model
+                data.pop('labels')
+                outputs = model_to_generate.generate(
+                **data,
+                pad_token_id = tokenizer.pad_token_id,
+                decoder_start_token_id=tokenizer.pad_token_id,
+                bos_token_id=tokenizer.eos_token_id,
+                eos_token_id = tokenizer.eos_token_id,
+                early_stopping = True,
+                do_sample = False,
+                num_beams = 20,
+                max_length = args.answer_max_length,
+                )
+                predict = tokenizer.batch_decode(outputs, skip_special_tokens = True)
+                actual = tokenizer.batch_decode(labels.cpu(), skip_special_tokens = True)
+            else:
+                predict = output.logits.argmax(dim=-1).cpu().tolist()
+                actual = data['labels'].cpu().tolist()
             predicts.extend(predict)
             actuals.extend(actual)
     acc = accuracy_score(actuals, predicts)
@@ -101,7 +121,7 @@ def get_args():
     
     # model input
     parser.add_argument('--max_length', type=int)
-    
+    parser.add_argument('--answer_max_length', type=int, default = 20)
     # distributed 관련
     parser.add_argument('--local_rank', type=int, default = -1)
     parser.add_argument('--distributed', type=str2bool, default = False)
@@ -142,7 +162,10 @@ def train():
         #train
         for data in iter_bar:
             step+=1
-            data = {i:j.cuda() for i,j in data.items()}
+            data = {i:j.cuda() for i,j in data.items() if i!='token_type_ids'}
+            if 't5' in args.ptm_path:
+                data['labels'][data['labels']==tokenizer.pad_token_id]=-100 # 굉장히 중요.
+            
             if args.fp16_model or not args.fp16:
                 output = model.forward(**data)
                 loss = output.loss
@@ -224,6 +247,7 @@ def train():
     if args.local_rank in [-1,0]:
         cur_path = os.path.join(args.output_dir,'best_model')
         os.makedirs(cur_path, exist_ok = True)
+        model_to_save = model.module if hasattr(model,'module') else model
         model_to_save.save_pretrained(cur_path)
         logger1.info('train_end')
         logger2.info('train end')
@@ -236,19 +260,11 @@ def get_tokenizer_and_model(args):
     tokenizer = AutoTokenizer.from_pretrained(args.ptm_path, padding_side=padding_side)
     if getattr(tokenizer, "pad_token_id") is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
-    model = AutoModelForSequenceClassification.from_pretrained(args.ptm_path, num_labels=args.n_labels, torch_dtype="auto", low_cpu_mem_usage=True)
-    
-    # kogpt
-#     tokenizer = AutoTokenizer.from_pretrained(
-#   'kakaobrain/kogpt', revision='KoGPT6B-ryan1.5b-float16',  # or float32 version: revision=KoGPT6B-ryan1.5b
-#   bos_token='[BOS]', eos_token='[EOS]', unk_token='[UNK]', pad_token='[PAD]', mask_token='[MASK]',
-# padding_side=padding_side)
-#     model = AutoModelForSequenceClassification.from_pretrained(
-#   'kakaobrain/kogpt', revision='KoGPT6B-ryan1.5b-float16',  # or float32 version: revision=KoGPT6B-ryan1.5b
-#   pad_token_id=tokenizer.eos_token_id,
-#   torch_dtype='auto', low_cpu_mem_usage=True, num_labels=args.n_labels
-# )
-    
+    if 't5' in args.ptm_path:
+        model =  AutoModelForSeq2SeqLM.from_pretrained(args.ptm_path, num_labels=args.n_labels, torch_dtype="auto", low_cpu_mem_usage=True, pad_token_id=tokenizer.pad_token_id)
+    else:
+        model = AutoModelForSequenceClassification.from_pretrained(args.ptm_path, num_labels=args.n_labels, torch_dtype="auto", low_cpu_mem_usage=True, pad_token_id=tokenizer.pad_token_id)
+    model.resize_token_embeddings(len(tokenizer))
     if args.model_path is not None:
         model_state_dict = torch.load(args.model_path, map_location='cpu')
         model.load_state_dict(model_state_dict)
@@ -257,7 +273,7 @@ def get_tokenizer_and_model(args):
     if 'bert' in args.ptm_path or 'roberta' in args.ptm_path:
         peft_config = LoraConfig(task_type="SEQ_CLS", inference_mode=False, r=args.r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout)
     elif 't5' in args.ptm_path:
-        pass
+        peft_config = LoraConfig(task_type="SEQ2SEQ_LM", inference_mode=False, r=args.r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout)
     else:
         peft_config = LoraConfig(task_type="CAUSAL_LM", inference_mode=False, r=args.r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout)
         
@@ -270,13 +286,19 @@ def get_tokenizer_and_model(args):
 def load_datasets(args, tokenizer):
     # LOAD DATASETS
     train_data = load_jsonl(args.train_data)
-    train_dataset = NLIDataset(train_data, tokenizer, args.max_length) # model type
+    if 't5' in args.ptm_path:
+        train_dataset = T5NLIDataset(train_data, tokenizer, args.max_length) # model type
+    else:
+        train_dataset = NLIDataset(train_data, tokenizer, args.max_length) # model type
     if args.distributed:
         # OK - legacy
         val_data = load_data(args.val_data, args.local_rank, args.distributed)
     else:
         val_data = load_jsonl(args.val_data)
-    val_dataset = NLIDataset(val_data, tokenizer, args.max_length)
+    if 't5' in args.ptm_path:
+        val_dataset = T5NLIDataset(val_data, tokenizer, args.max_length)
+    else:        
+        val_dataset = NLIDataset(val_data, tokenizer, args.max_length)
     return train_dataset, val_dataset
         
         
@@ -300,6 +322,7 @@ if __name__=='__main__':
     ########################################################################################
     # distributed 관련
     ########################################################################################
+    args.local_rank = int(os.environ["LOCAL_RANK"])
     if args.distributed:
         assert torch.cuda.is_available()
         assert torch.cuda.device_count()>1

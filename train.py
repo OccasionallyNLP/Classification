@@ -81,6 +81,7 @@ def get_args():
     
     # 경량화
     parser.add_argument('--fp16', type=str2bool, default = True)
+    parser.add_argument('--fp16_model', type=str2bool, default = False)
     
     # PTM model
     parser.add_argument('--ptm_path', type=str)
@@ -130,7 +131,21 @@ def train():
         for data in iter_bar:
             step+=1
             data = {i:j.cuda() for i,j in data.items()}
-            if args.fp16:
+            if args.fp16_model or not args.fp16:
+                output = model.forward(**data)
+                loss = output.loss
+                loss = loss / args.accumulation_steps
+                loss.backward()
+                if step%args.accumulation_steps==0 or (
+                    len(train_dataloader) <= args.accumulation_steps
+                    and (step) == len(train_dataloader)
+            ):
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    global_step+=1
+            else:
                 with autocast():
                     output = model.forward(**data)
                     loss = output.loss
@@ -147,20 +162,6 @@ def train():
                         scheduler.step()
                         optimizer.zero_grad()
                         global_step+=1
-            else:
-                output = model.forward(**data)
-                loss = output.loss
-                loss = loss / args.accumulation_steps
-                loss.backward()
-                if step%args.accumulation_steps==0 or (
-                    len(train_dataloader) <= args.accumulation_steps
-                    and (step) == len(train_dataloader)
-            ):
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad()
-                    global_step+=1
                     
             if args.distributed:
                 torch.distributed.reduce(loss, 0)

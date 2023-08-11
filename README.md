@@ -25,3 +25,6 @@ Encoder model
 |token 길이|min|median|95%|max|
 |:------:|:---:|:---:|:---:|:---:|
 ||27|92|170|262|
+
+## To do
+lora n_labels 1인 경우 해결
